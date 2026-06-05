@@ -40,7 +40,7 @@ client.on(Events.MessageCreate, async (message) => {
 
         const raw = message.toJSON();
 
-        let song, artist;
+        let song, artist, album;
 
         const container = raw.components?.[0];
 
@@ -63,8 +63,9 @@ client.on(Events.MessageCreate, async (message) => {
             }
 
             song = songLine.slice(songLine.indexOf('[') + 1, songLine.indexOf(']'));
-            const [artistPart] = artistLine.split(' • ');
+            const [artistPart, albumPart] = artistLine.split(' • ');
             artist = artistPart.replaceAll('**', '');
+            album  = albumPart?.replaceAll('*', '').replace('\\:', ':');
         } else {
             const lines = message.content.split('\n');
 
@@ -72,6 +73,7 @@ client.on(Events.MessageCreate, async (message) => {
                 // "Text" format: **Song**\nBy Artist | Album\n...
                 song   = lines[0].replaceAll('**', '');
                 artist = lines[1].slice(3, lines[1].indexOf(' |')).replaceAll('**', '');
+                album  = lines[1].slice(lines[1].indexOf(' | ') + 3).replaceAll('*', '');
             } else {
                 // "Text one-line" format: **User** is listening to **Song** by **Artist**
                 const afterListening = message.content.split(' is listening to ')[1];
@@ -87,7 +89,7 @@ client.on(Events.MessageCreate, async (message) => {
 
         try {
             const token = await getSpotifyToken();
-            const trackUri = await searchTrack(token, song, artist);
+            const trackUri = await searchTrack(token, song, artist, album);
 
             if (trackUri) {
                 if (await isTrackInPlaylist(token, trackUri)) {
@@ -130,8 +132,10 @@ async function getSpotifyToken() {
     return data.access_token;
 }
 
-async function searchTrack(token, song, artist) {
-    const query = `track:${song} artist:${artist}`;
+async function searchTrack(token, song, artist, album) {
+    const query = album
+        ? `track:${song} artist:${artist} album:${album}`
+        : `track:${song} artist:${artist}`;
 
     const response = await fetch(
         `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=1`,
