@@ -5,6 +5,13 @@ const { Client, Events, GatewayIntentBits } = require('discord.js');
 const ADDED_REACT = process.env.ADDED_REACT ?? String.fromCodePoint(0x2795);
 const DUPLICATE_REACT = process.env.DUPLICATE_REACT ?? String.fromCodePoint(0x267B);
 
+const log = {
+    timestamp: () => new Date().toISOString().replace('T', ' ').slice(0, 19),
+    info:  (msg) => console.log(`[${log.timestamp()}] [INFO]  ${msg}`),
+    warn:  (msg) => console.warn(`[${log.timestamp()}] [WARN]  ${msg}`),
+    error: (msg) => console.error(`[${log.timestamp()}] [ERROR] ${msg}`),
+};
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -16,11 +23,11 @@ const client = new Client({
 const pending = new Map();
 
 client.on(Events.ClientReady, () => {
-    console.log('Online');
+    log.info('Online');
 });
 
 client.on(Events.MessageCreate, async (message) => {
-    if (!message.author.bot && message.content.trim() === '.np') {
+    if (!message.author.bot && ['.np', '.fm'].includes(message.content.trim())) {
         const timeout = setTimeout(() => pending.delete(message.channelId), 10_000);
         pending.set(message.channelId, { timeout, user: message.author.username });
         return;
@@ -33,23 +40,50 @@ client.on(Events.MessageCreate, async (message) => {
 
         const raw = message.toJSON();
 
+        let song, artist;
+
         const container = raw.components?.[0];
-        const first = container?.components?.[0];
-        const mainText = first?.type === 9
-            ? first?.components?.[0]?.content ?? ''
-            : first?.content ?? '';
 
-        const lines = mainText.split('\n');
+        if (container?.type === 17) {
+            const first = container?.components?.[0];
+            const mainText = first?.type === 9
+                ? first?.components?.[0]?.content ?? ''
+                : first?.content ?? '';
 
-        if (!lines[1] || !lines[2]) {
-            console.log('Unexpected fmbot format:', JSON.stringify(raw.components, null, 2));
-            return;
+            const lines = mainText.split('\n');
+
+            // "Embed tiny" starts with **[Song], regular embed starts with -# Now playing
+            const isTiny = lines[0].startsWith('**[');
+            const songLine   = isTiny ? lines[0] : lines[1];
+            const artistLine = isTiny ? lines[1] : lines[2];
+
+            if (!songLine || !artistLine) {
+                log.warn('Unexpected fmbot format: ' + JSON.stringify(raw.components, null, 2));
+                return;
+            }
+
+            song = songLine.slice(songLine.indexOf('[') + 1, songLine.indexOf(']'));
+            const [artistPart] = artistLine.split(' • ');
+            artist = artistPart.replaceAll('**', '');
+        } else {
+            const lines = message.content.split('\n');
+
+            if (lines[0].startsWith('**') && lines[1]?.startsWith('By ')) {
+                // "Text" format: **Song**\nBy Artist | Album\n...
+                song   = lines[0].replaceAll('**', '');
+                artist = lines[1].slice(3, lines[1].indexOf(' |')).replaceAll('**', '');
+            } else {
+                // "Text one-line" format: **User** is listening to **Song** by **Artist**
+                const afterListening = message.content.split(' is listening to ')[1];
+                if (!afterListening) {
+                    log.warn('Unexpected fmbot text format: ' + message.content);
+                    return;
+                }
+                const [songPart, artistPart] = afterListening.split(' by ');
+                song   = songPart.replaceAll('**', '');
+                artist = artistPart.replaceAll('**', '');
+            }
         }
-
-        const song = lines[1].slice(lines[1].indexOf('[') + 1, lines[1].indexOf(']'));
-        const [artistPart, albumPart] = lines[2].split(' • ');
-        const artist = artistPart.replaceAll('**', '');
-        const album = albumPart.replaceAll('*', '').replace('\\:', ':');
 
         try {
             const token = await getSpotifyToken();
@@ -57,20 +91,20 @@ client.on(Events.MessageCreate, async (message) => {
 
             if (trackUri) {
                 if (await isTrackInPlaylist(token, trackUri)) {
-                    console.log(`Already in playlist: ${song} by ${artist}`);
+                    log.info(`Already in playlist: ${song} by ${artist}`);
                     await new Promise(resolve => setTimeout(resolve, 1000));
                     await message.react(DUPLICATE_REACT);
                 } else {
                     await addToPlaylist(token, trackUri);
-                    console.log(`Added: ${song} by ${artist}`);
+                    log.info(`Added: ${song} by ${artist}`);
                     await new Promise(resolve => setTimeout(resolve, 1000));
                     await message.react(ADDED_REACT);
                 }
             } else {
-                console.log(`Not found on Spotify: ${song} by ${artist}`);
+                log.warn(`Not found on Spotify: ${song} by ${artist}`);
             }
         } catch (err) {
-            console.error(`Spotify error for "${song}" by ${artist}:`, err.message);
+            log.error(`Spotify error for "${song}" by ${artist}: ${err.message}`);
         }
     }
 });
@@ -118,7 +152,7 @@ async function isTrackInPlaylist(token, trackUri) {
         const data = await response.json();
 
         if (!data.items) {
-            console.error('Unexpected playlist response:', JSON.stringify(data));
+            log.error('Unexpected playlist response: ' + JSON.stringify(data));
             return false;
         }
 
