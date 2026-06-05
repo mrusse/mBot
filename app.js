@@ -2,6 +2,9 @@ require('dotenv').config();
 
 const { Client, Events, GatewayIntentBits } = require('discord.js');
 
+const ADDED_REACT = process.env.ADDED_REACT ?? String.fromCodePoint(0x2795);
+const DUPLICATE_REACT = process.env.DUPLICATE_REACT ?? String.fromCodePoint(0x267B);
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -55,9 +58,13 @@ client.on(Events.MessageCreate, async (message) => {
             if (trackUri) {
                 if (await isTrackInPlaylist(token, trackUri)) {
                     console.log(`Already in playlist: ${song} by ${artist}`);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    await message.react(DUPLICATE_REACT);
                 } else {
                     await addToPlaylist(token, trackUri);
                     console.log(`Added: ${song} by ${artist}`);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    await message.react(ADDED_REACT);
                 }
             } else {
                 console.log(`Not found on Spotify: ${song} by ${artist}`);
@@ -102,13 +109,18 @@ async function searchTrack(token, song, artist) {
 }
 
 async function isTrackInPlaylist(token, trackUri) {
-    let url = `https://api.spotify.com/v1/playlists/${process.env.SPOTIFY_PLAYLIST_ID}/tracks?fields=items(track(uri)),next&limit=100`;
+    let url = `https://api.spotify.com/v1/playlists/${process.env.SPOTIFY_PLAYLIST_ID}/tracks?limit=100`;
 
     while (url) {
         const response = await fetch(url, {
             headers: { 'Authorization': `Bearer ${token}` }
         });
         const data = await response.json();
+
+        if (!data.items) {
+            console.error('Unexpected playlist response:', JSON.stringify(data));
+            return false;
+        }
 
         if (data.items.some(item => item.track?.uri === trackUri)) return true;
 
