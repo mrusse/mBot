@@ -2,8 +2,8 @@ require('dotenv').config();
 
 const { Client, Events, GatewayIntentBits } = require('discord.js');
 
-const ADDED_REACT = process.env.ADDED_REACT ?? String.fromCodePoint(0x2795);
-const DUPLICATE_REACT = process.env.DUPLICATE_REACT ?? String.fromCodePoint(0x267B);
+const ADDED_REACT = process.env.ADDED_REACT || String.fromCodePoint(0x2795);
+const DUPLICATE_REACT = process.env.DUPLICATE_REACT || String.fromCodePoint(0x267B);
 
 const log = {
     timestamp: () => new Date().toISOString().replace('T', ' ').slice(0, 19),
