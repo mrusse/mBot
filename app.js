@@ -31,10 +31,18 @@ client.on(Events.MessageCreate, async (message) => {
         const raw = message.toJSON();
 
         const container = raw.components?.[0];
-        const section = container?.components?.[0];
-        const mainText = section?.components?.[0]?.content ?? '';
+        const first = container?.components?.[0];
+        const mainText = first?.type === 9
+            ? first?.components?.[0]?.content ?? ''
+            : first?.content ?? '';
 
         const lines = mainText.split('\n');
+
+        if (!lines[1] || !lines[2]) {
+            console.log('Unexpected fmbot format:', JSON.stringify(raw.components, null, 2));
+            return;
+        }
+
         const song = lines[1].slice(lines[1].indexOf('[') + 1, lines[1].indexOf(']'));
         const [artistPart, albumPart] = lines[2].split(' • ');
         const artist = artistPart.replaceAll('**', '');
