@@ -1,0 +1,25 @@
+{
+  "name": "mbot",
+  "version": "1.0.0",
+  "description": "Discord bot for fun music stuff.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mrusse/mBot.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/mrusse/mBot/issues"
+  },
+  "homepage": "https://github.com/mrusse/mBot#readme",
+  "dependencies": {
+    "discord.js": "^14.26.4",
+    "dotenv": "^16.6.1"
+  }
+}
