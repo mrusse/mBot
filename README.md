@@ -5,12 +5,12 @@ A Discord bot that listens for `.np` or `.fm` commands and automatically adds th
 ## Discord Bot Setup
 
 - Create a new application in the [Discord Developer Portal](https://discord.com/developers/applications).
-- In the **Bot** tab, enable the **Message Content Intent** under *Privileged Gateway Intents*.
+- In the **Bot** tab, enable the **Message Content Intent** under **Privileged Gateway Intents**.
 - In the **Bot** tab, click **Reset Token** to generate a token. Save this for later.
 - In the **Installation** tab under **Default Install Settings** > **Guild Install**, add the `bot` scope and the following permissions:
   - Add Reactions
   - Manage Messages
-- Copy the *Install Link* from the **Installation** tab, open it in your browser, and add the bot to your server.
+- Copy the **Install Link** from the **Installation** tab, open it in your browser, and add the bot to your server.
 
 ## Spotify App Setup
 
