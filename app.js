@@ -27,7 +27,7 @@ client.on(Events.ClientReady, () => {
 });
 
 client.on(Events.MessageCreate, async (message) => {
-    if (!message.author.bot && ['.np', '.fm'].includes(message.content.trim())) {
+    if (!message.author.bot && ['.np', '.fm'].some(cmd => message.content.trimStart().startsWith(cmd))) {
         const timeout = setTimeout(() => pending.delete(message.channelId), 10_000);
         pending.set(message.channelId, { timeout, user: message.author.username });
         return;
