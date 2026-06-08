@@ -27,7 +27,10 @@ client.on(Events.ClientReady, () => {
 });
 
 client.on(Events.MessageCreate, async (message) => {
-    if (!message.author.bot && ['.np', '.fm'].some(cmd => message.content.trimStart().startsWith(cmd))) {
+    const content = message.content.trimStart();
+    const isCommand = ['.np', '.fm'].some(cmd => content === cmd || content.startsWith(cmd + ' '));
+
+    if (!message.author.bot && isCommand) {
         const timeout = setTimeout(() => pending.delete(message.channelId), 10_000);
         pending.set(message.channelId, { timeout, user: message.author.username });
         return;
@@ -133,10 +136,14 @@ async function getSpotifyToken() {
 }
 
 async function searchTrack(token, song, artist, album) {
-    const query = album
-        ? `track:${song} artist:${artist} album:${album}`
-        : `track:${song} artist:${artist}`;
+    const filtered = album
+        ? `track:"${song}" artist:"${artist}" album:"${album}"`
+        : `track:"${song}" artist:"${artist}"`;
 
+    return (await runSearch(token, filtered)) ?? (await runSearch(token, `${song} ${artist}`));
+}
+
+async function runSearch(token, query) {
     const response = await fetch(
         `https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=1`,
         { headers: { 'Authorization': `Bearer ${token}` } }
