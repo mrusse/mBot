@@ -21,6 +21,7 @@ const client = new Client({
 });
 
 const pending = new Map();
+const processed = new Set();
 
 client.on(Events.ClientReady, () => {
     log.info('Online');
@@ -37,6 +38,10 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (message.author.bot && pending.has(message.channelId)) {
+        if (processed.has(message.id)) return;
+        processed.add(message.id);
+        setTimeout(() => processed.delete(message.id), 60_000);
+
         const { timeout } = pending.get(message.channelId);
         clearTimeout(timeout);
         pending.delete(message.channelId);
@@ -92,7 +97,12 @@ client.on(Events.MessageCreate, async (message) => {
 
         try {
             const token = await getSpotifyToken();
-            const trackUri = await searchTrack(token, song, artist, album);
+            let trackUri = await searchTrack(token, song, artist, album);
+
+            if (!trackUri) {
+                await new Promise(resolve => setTimeout(resolve, 10_000));
+                trackUri = await searchTrack(token, song, artist, album);
+            }
 
             if (trackUri) {
                 if (await isTrackInPlaylist(token, trackUri)) {
@@ -132,6 +142,11 @@ async function getSpotifyToken() {
     });
 
     const data = await response.json();
+
+    if (!response.ok) {
+        log.error(`Spotify token request failed (${response.status}): ${JSON.stringify(data)}`);
+    }
+
     return data.access_token;
 }
 
@@ -139,8 +154,15 @@ async function searchTrack(token, song, artist, album) {
     const filtered = album
         ? `track:"${song}" artist:"${artist}" album:"${album}"`
         : `track:"${song}" artist:"${artist}"`;
+    const fallback = `${song} ${artist}`;
 
-    return (await runSearch(token, filtered)) ?? (await runSearch(token, `${song} ${artist}`));
+    const uri = (await runSearch(token, filtered)) ?? (await runSearch(token, fallback));
+
+    if (!uri) {
+        log.warn(`No Spotify match for queries: "${filtered}" / "${fallback}"`);
+    }
+
+    return uri;
 }
 
 async function runSearch(token, query) {
@@ -150,6 +172,12 @@ async function runSearch(token, query) {
     );
 
     const data = await response.json();
+
+    if (!response.ok) {
+        log.error(`Spotify search request failed (${response.status}) for "${query}": ${JSON.stringify(data)}`);
+        return undefined;
+    }
+
     return data.tracks?.items?.[0]?.uri;
 }
 
