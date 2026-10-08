@@ -1,6 +1,7 @@
 require('dotenv').config();
 
-const { Client, Events, GatewayIntentBits } = require('discord.js');
+const { ChannelType, Client, Events, GatewayIntentBits, Partials } = require('discord.js');
+const setupLeaderboard = require('./leaderboard');
 
 const ADDED_REACT = process.env.ADDED_REACT || String.fromCodePoint(0x2795);
 const DUPLICATE_REACT = process.env.DUPLICATE_REACT || String.fromCodePoint(0x267B);
@@ -16,15 +17,34 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ]
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMessageReactions
+    ],
+    // Reactions on messages sent before the bot started arrive as partials
+    partials: [Partials.Message, Partials.Reaction, Partials.User]
 });
+
+setupLeaderboard(client, log);
 
 const pending = new Map();
 const processed = new Set();
 
 client.on(Events.ClientReady, () => {
     log.info('Online');
+
+    // Log what the bot is allowed to do
+    for (const guild of client.guilds.cache.values()) {
+        const perms = guild.members.me.permissions;
+        log.info(`Permissions in ${guild.name}: ${perms.has('Administrator') ? 'Administrator (all)' : perms.toArray().join(', ')}`);
+
+        const unreadable = guild.channels.cache
+            .filter(c => [ChannelType.GuildText, ChannelType.GuildAnnouncement].includes(c.type)
+                && !c.permissionsFor(guild.members.me).has(['ViewChannel', 'ReadMessageHistory']))
+            .map(c => '#' + c.name);
+        if (unreadable.length) {
+            log.info(`Channels the bot can't read history in: ${unreadable.join(', ')}`);
+        }
+    }
 });
 
 client.on(Events.MessageCreate, async (message) => {

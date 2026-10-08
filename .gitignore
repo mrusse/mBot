@@ -104,3 +104,5 @@ dist
 
 # for hydrocity
 .DS_STORE
+# Leaderboard database (generated at runtime)
+leaderboard.db*

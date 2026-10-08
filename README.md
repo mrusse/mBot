@@ -1,6 +1,9 @@
 # mBot
 
-A Discord bot that listens for `.np` or `.fm` commands and automatically adds the currently playing song (reported by [.fmbot](https://fmbot.xyz/)) to a Spotify playlist.
+A Discord bot for fun music stuff (and a bit more) in your server:
+
+- **Shared playlist**: when someone runs `.np` or `.fm`, mBot grabs the song [.fmbot](https://fmbot.xyz/) reports and adds it to a Spotify playlist.
+- **Reaction leaderboards**: `/leaderboard` ranks who has received or given the most of any emoji you choose to track.
 
 ## Discord Bot Setup
 
@@ -10,6 +13,8 @@ A Discord bot that listens for `.np` or `.fm` commands and automatically adds th
 - In the **Installation** tab under **Default Install Settings** > **Guild Install**, add the `bot` scope and the following permissions:
   - Add Reactions
   - Manage Messages
+  - Read Message History (needed to react, and to count older reactions for the leaderboard)
+- Also add the `applications.commands` scope so the bot can register its slash commands.
 - Copy the **Install Link** from the **Installation** tab, open it in your browser, and add the bot to your server.
 
 ## Spotify App Setup
@@ -55,6 +60,39 @@ node spotify-auth.js
 ```
 
 It will print an authorization URL. Open it in your browser, log into Spotify, then copy the full URL from the address bar after the redirect and paste it back into the terminal. The page won't load but that's fine, all you need is the URL.
+
+## Reaction Leaderboard
+
+The bot keeps a leaderboard of who has received the most of certain reactions. Only emojis listed in `leaderboard-config.json` are tracked.
+
+```json
+{
+    "emojis": ["upvote:123456789012345678", "downvote:123456789012345679"]
+}
+```
+
+Custom emojis use the same `name:id` format as `ADDED_REACT` (animated ones look like `a:name:id`). They are matched by name (ignoring capitalisation), so every upload of `:upvote:`, including old re-uploads and copies from other servers, counts as the same emoji. The ID is only used to display the emoji. Changes to the file take effect without a restart.
+
+`/leaderboard <emoji> [type] [channel] [content]` shows the top 10 users for that reaction, plus the rank of whoever ran it. Anyone can use it, and the emoji field autocompletes from the configured list.
+
+- `type`: **Received** (default) ranks people by reactions on their messages; **Given** ranks people by reactions they handed out.
+- `channel`: only count messages in one channel.
+- `content`: **Media only** (uploaded files, images, link previews and stickers) or **Text only**.
+
+Reactions from bots, reactions on bot messages, and reacting to your own message are not counted. Deleted messages drop off the leaderboard.
+
+### How it's stored
+
+Everything is kept in `leaderboard.db`, a SQLite database file next to the bot (Node's built-in SQLite, so there is nothing extra to install). It stores only IDs, counts and flags: message, channel, author and reactor IDs, which emojis are on each message, and whether the message has media. Message content and usernames are never stored, and messages without reactions aren't stored at all. When running in Docker, keep this file on a mapped volume so it survives the container being recreated.
+
+### Scanning
+
+On first start the bot builds the database in two phases. Progress is logged every minute and saved as it goes, so a restart continues where it left off. The leaderboard works the whole time, showing partial results with a "still counting" note.
+
+1. **Message scan**: reads the history of every channel the bot can read and stores each message that has reactions, with the counts of every emoji on it. Until phase 2 reaches a message, its received count uses the reaction total.
+2. **Who-reacted lookup**: for tracked emojis, asks Discord who reacted to each message. This fills in given counts and makes received counts exact. It is rate limited by Discord, so on a large server it can take many hours; the log shows an estimated time left.
+
+After that, reactions are tracked live and nothing is rescanned. Adding an emoji to the config only runs phase 2 for that emoji, since every emoji's counts are already stored. Channels that are created later, or that the bot gains access to later, are scanned automatically. On startup the bot logs its server permissions and any channels whose history it can't read.
 
 ## Running
 
