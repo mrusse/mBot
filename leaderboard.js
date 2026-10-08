@@ -1,6 +1,9 @@
 const fs = require('fs');
 const path = require('path');
 const {
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
     ChannelType,
     EmbedBuilder,
     Events,
@@ -10,51 +13,88 @@ const {
     Routes,
     SlashCommandBuilder
 } = require('discord.js');
-const { openDatabase, emojiKey, hasMedia } = require('./leaderboard-db');
+const { openDatabase, hasMedia, createdAt, usageInBackground } = require('./leaderboard-db');
 
 const CONFIG_PATH = path.join(__dirname, 'leaderboard-config.json');
 const DB_PATH = path.join(__dirname, 'leaderboard.db');
 const TOP_N = 10;
+// /topmessages shows up to this many pages of TOP_N, and its page buttons last this long
+const MAX_PAGES = 5;
+const PAGE_BUTTONS_MS = 14 * 60_000;
 const SCAN_CONCURRENCY = 5;
 const READ_PERMS = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory];
 const SCANNED_CHANNEL_TYPES = [ChannelType.GuildText, ChannelType.GuildAnnouncement];
 
+const DAY = 24 * 60 * 60 * 1000;
+const PERIODS = {
+    day: { label: 'Past day', ms: DAY },
+    week: { label: 'Past week', ms: 7 * DAY },
+    month: { label: 'Past month', ms: 30 * DAY },
+    year: { label: 'Past year', ms: 365 * DAY }
+};
+
+// Filters shared by /leaderboard and /topmessages
+const addFilterOptions = (command) => command
+    .addChannelOption(opt => opt
+        .setName('channel')
+        .setDescription('Only count messages in this channel')
+        .addChannelTypes(...SCANNED_CHANNEL_TYPES))
+    .addStringOption(opt => opt
+        .setName('content')
+        .setDescription('Only count messages with media (files, images, link previews, stickers) or text only')
+        .addChoices(
+            { name: 'All messages', value: 'all' },
+            { name: 'Media only', value: 'media' },
+            { name: 'Text only', value: 'text' }))
+    .addStringOption(opt => opt
+        .setName('period')
+        .setDescription('Only count messages posted in this time period (default: all time)')
+        .addChoices(
+            ...Object.entries(PERIODS).map(([value, { label }]) => ({ name: label, value })),
+            { name: 'All time', value: 'all' }));
+
+const emojiOption = (description) => (opt) => opt
+    .setName('emoji')
+    .setDescription(description)
+    .setRequired(true)
+    .setAutocomplete(true);
+
 const commands = [
-    new SlashCommandBuilder()
+    addFilterOptions(new SlashCommandBuilder()
         .setName('leaderboard')
         .setDescription('Show who has received or given the most of a reaction')
         .setContexts(InteractionContextType.Guild)
-        .addStringOption(opt => opt
-            .setName('emoji')
-            .setDescription('The reaction to rank by')
-            .setRequired(true)
-            .setAutocomplete(true))
+        .addStringOption(emojiOption('The reaction to rank by'))
         .addStringOption(opt => opt
             .setName('type')
             .setDescription('Rank by reactions received (default) or given')
-            .addChoices({ name: 'Received', value: 'received' }, { name: 'Given', value: 'given' }))
-        .addChannelOption(opt => opt
-            .setName('channel')
-            .setDescription('Only count messages in this channel')
-            .addChannelTypes(...SCANNED_CHANNEL_TYPES))
-        .addStringOption(opt => opt
-            .setName('content')
-            .setDescription('Only count messages with media (files, images, link previews, stickers) or text only')
-            .addChoices(
-                { name: 'All messages', value: 'all' },
-                { name: 'Media only', value: 'media' },
-                { name: 'Text only', value: 'text' }))
+            .addChoices({ name: 'Received', value: 'received' }, { name: 'Given', value: 'given' }))),
+    addFilterOptions(new SlashCommandBuilder()
+        .setName('topmessages')
+        .setDescription('Show the messages with the most of a reaction')
+        .setContexts(InteractionContextType.Guild)
+        .addStringOption(emojiOption('The reaction to rank messages by'))
+        .addUserOption(opt => opt
+            .setName('user')
+            .setDescription("Only show this person's messages")))
 ];
+const COMMAND_NAMES = commands.map(c => c.name);
 
 // Custom emojis are keyed by lowercase name, so every upload of an emoji with the same name counts together; standard emojis by the character
+// label is what autocomplete shows. Standard emojis can be given a name to search by, as "skull:💀".
 function parseEmoji(text) {
     const trimmed = text.trim();
     const custom = trimmed.match(/^<?(?:(a):)?:?(\w+):(\d+)>?$/);
     if (custom) {
         const [, animated, name, id] = custom;
-        return { key: name.toLowerCase(), name, display: `<${animated ? 'a' : ''}:${name}:${id}>` };
+        return { key: name.toLowerCase(), name, label: name, display: `<${animated ? 'a' : ''}:${name}:${id}>` };
     }
-    return { key: trimmed, name: trimmed, display: trimmed };
+    const named = trimmed.match(/^(\w+):(.+)$/u);
+    if (named) {
+        const [, name, emoji] = named;
+        return { key: emoji, name, label: `${emoji} ${name}`, display: emoji };
+    }
+    return { key: trimmed, name: trimmed, label: trimmed, display: trimmed };
 }
 
 const formatDuration = (ms) => {
@@ -63,16 +103,19 @@ const formatDuration = (ms) => {
 };
 
 module.exports = function setupLeaderboard(client, log) {
-    let config = { mtime: 0, tracked: [], lastError: null };
+    let config = { mtime: 0, listed: [], allServerEmojis: false, lastError: null };
 
     // Re-read the config whenever the file changes, so edits apply without a restart
-    function getTracked() {
+    function loadConfig() {
         try {
             const { mtimeMs } = fs.statSync(CONFIG_PATH);
             if (mtimeMs !== config.mtime) {
-                const { emojis = [] } = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-                config = { mtime: mtimeMs, tracked: emojis.map(parseEmoji), lastError: null };
-                log.info(`Leaderboard tracking: ${config.tracked.map(e => e.name).join(', ') || '(none)'}`);
+                const { emojis = [], allServerEmojis = false } = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+                config = { mtime: mtimeMs, listed: emojis.map(parseEmoji), allServerEmojis: allServerEmojis === true, lastError: null };
+                const listed = config.listed.map(e => e.name).join(', ');
+                log.info('Leaderboard tracking: ' + (config.allServerEmojis
+                    ? 'all server emojis' + (listed ? ` + ${listed}` : '')
+                    : listed || '(none)'));
             }
         } catch (err) {
             if (err.message !== config.lastError) {
@@ -80,7 +123,24 @@ module.exports = function setupLeaderboard(client, log) {
                 config.lastError = err.message;
             }
         }
-        return config.tracked;
+        return config;
+    }
+
+    // The emojis tracked in a server: those listed in the config, plus with allServerEmojis every custom
+    // emoji the server has. Listing a server emoji too is harmless; listing one from another server
+    // (used with Nitro) still tracks it.
+    function getTracked(guild) {
+        const { listed, allServerEmojis } = loadConfig();
+        if (!allServerEmojis || !guild) return listed;
+        const fromServer = [...guild.emojis.cache.values()]
+            .filter(e => e.name)
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .map(e => ({ key: e.name.toLowerCase(), name: e.name, label: e.name, display: e.toString() }));
+        const tracked = new Map();
+        for (const e of [...fromServer, ...listed]) {
+            if (!tracked.has(e.key)) tracked.set(e.key, e);
+        }
+        return [...tracked.values()];
     }
 
     const db = openDatabase(DB_PATH);
@@ -116,11 +176,18 @@ module.exports = function setupLeaderboard(client, log) {
             const full = message.partial ? await message.fetch() : message;
             if (full.author.bot) return;
 
-            const needsLookup = db.transaction(() => {
+            db.transaction(() => {
                 db.storeMessage(full);
-                return db.markSoleReactor(full.id, reaction.emoji, user.id);
+                db.markSoleReactor(full.id, reaction.emoji, user.id);
             });
-            if (needsLookup && getTracked().some(e => e.key === emojiKey(reaction.emoji))) scheduleScan();
+
+            // If the message already had reactions the bot missed (e.g. while restarting), look up who
+            // reacted now rather than waiting behind a long background lookup job
+            const tracked = new Set(getTracked(full.guild).map(e => e.key));
+            for (const row of db.pendingForMessage(full.id).filter(r => tracked.has(r.match_key))) {
+                const users = await withRetry('Who-reacted lookup', () => fetchAllReactors(full.channelId, row));
+                db.setReactors(row.message_id, row.emoji, users);
+            }
         } catch (err) {
             log.error(`Leaderboard reaction update failed: ${err.message}`);
         }
@@ -151,6 +218,30 @@ module.exports = function setupLeaderboard(client, log) {
         if (hasMedia(message) && db.hasMessage(message.id)) db.setMedia(message.id);
     }));
 
+    // Network failures and Discord server errors (5xx) are temporary, e.g. the internet dropping out.
+    // Real API errors (4xx) have a status below 500 and are not retried here.
+    const isTemporary = (err) => err.status === undefined || err.status >= 500;
+    let lastOutageLog = 0;
+
+    // Retries temporary failures with a growing wait (15s up to 5 minutes), so an outage pauses
+    // the scan instead of skipping everything it would have checked in the meantime
+    async function withRetry(label, fn) {
+        let wait = 0;
+        while (true) {
+            try {
+                return await fn();
+            } catch (err) {
+                if (!isTemporary(err)) throw err;
+                wait = Math.min(wait ? wait * 2 : 15_000, 300_000);
+                if (Date.now() - lastOutageLog > 60_000) {
+                    lastOutageLog = Date.now();
+                    log.warn(`${label}: can't reach Discord (${err.message}), retrying in ${wait / 1000}s`);
+                }
+                await new Promise(resolve => setTimeout(resolve, wait));
+            }
+        }
+    }
+
     // ---- Phase 1: store every message that has reactions ----
 
     async function scanMessages(guild, channels) {
@@ -170,7 +261,8 @@ module.exports = function setupLeaderboard(client, log) {
         async function scanChannel(channel) {
             let { before } = db.channelScan(channel.id);
             while (true) {
-                const batch = await channel.messages.fetch({ limit: 100, before: before ?? undefined });
+                const batch = await withRetry('Message scan',
+                    () => channel.messages.fetch({ limit: 100, before: before ?? undefined }));
                 scanned += batch.size;
                 const done = batch.size < 100;
                 before = batch.lastKey() ?? before;
@@ -259,7 +351,7 @@ module.exports = function setupLeaderboard(client, log) {
                 if (!rows.length) return;
                 for (const row of rows) {
                     try {
-                        db.setReactors(row.message_id, row.emoji, await fetchAllReactors(channelId, row));
+                        db.setReactors(row.message_id, row.emoji, await withRetry('Who-reacted lookup', () => fetchAllReactors(channelId, row)));
                     } catch (err) {
                         // 10008 = Unknown Message: it was deleted
                         if (err.code === 10008) {
@@ -296,7 +388,6 @@ module.exports = function setupLeaderboard(client, log) {
 
     let scanRunning = false;
     let scanQueued = false;
-    let scanTimer = null;
     const scanningGuilds = new Set();
 
     // Scans any readable channel that hasn't been scanned yet (new, or newly readable), then looks up
@@ -311,8 +402,6 @@ module.exports = function setupLeaderboard(client, log) {
         try {
             do {
                 scanQueued = false;
-                const keys = getTracked().map(e => e.key);
-
                 for (const guild of client.guilds.cache.values()) {
                     const textChannels = [...guild.channels.cache.values()]
                         .filter(c => SCANNED_CHANNEL_TYPES.includes(c.type));
@@ -332,8 +421,15 @@ module.exports = function setupLeaderboard(client, log) {
                         } finally {
                             scanningGuilds.delete(guild.id);
                         }
+                        // The scan changed how often each emoji is used
+                        await refreshUsage();
                     }
 
+                    // Most used emojis are looked up first, so the leaderboards people actually use become
+                    // exact soonest
+                    const used = emojiUsage(guild.id);
+                    const keys = getTracked(guild).map(e => e.key)
+                        .sort((a, b) => (used.get(b) ?? 0) - (used.get(a) ?? 0));
                     if (keys.length) await lookupReactors(guild, keys);
                 }
             } while (scanQueued);
@@ -344,17 +440,13 @@ module.exports = function setupLeaderboard(client, log) {
         }
     }
 
-    // Batches up lookups needed by live reactions instead of running one per reaction
-    function scheduleScan() {
-        scanTimer ??= setTimeout(() => {
-            scanTimer = null;
-            runScans();
-        }, 60_000);
-    }
 
     // New emojis in the config, new channels, or permission changes that may let the bot read more channels
     fs.watchFile(CONFIG_PATH, { interval: 2000 }, () => runScans());
     client.on(Events.GuildCreate, () => runScans());
+    // With allServerEmojis, newly uploaded or renamed emojis start being tracked
+    client.on(Events.GuildEmojiCreate, () => runScans());
+    client.on(Events.GuildEmojiUpdate, () => runScans());
     client.on(Events.ChannelCreate, () => runScans());
     client.on(Events.ChannelUpdate, () => runScans());
     client.on(Events.GuildRoleUpdate, () => runScans());
@@ -369,75 +461,204 @@ module.exports = function setupLeaderboard(client, log) {
         } catch (err) {
             log.error(`Failed to register slash commands: ${err.message}`);
         }
+        // Usage totals decide the lookup order, so get them before the first scan
+        await refreshUsage();
         runScans();
     });
 
-    // ---- /leaderboard ----
+    // ---- /leaderboard and /topmessages ----
+
+    // How often each emoji is used per server, for ordering autocomplete. Adding up every stored reaction
+    // takes a while, so it runs in the background and autocomplete uses the last totals in the meantime.
+    const USAGE_REFRESH_MS = 10 * 60_000;
+    let usage = { at: 0, byGuild: new Map(), refreshing: null };
+
+    // Returns a promise for callers that need the totals before carrying on
+    function refreshUsage() {
+        if (usage.refreshing) return usage.refreshing;
+        usage.refreshing = usageInBackground(DB_PATH, [...client.guilds.cache.keys()])
+            .then(byGuild => { usage = { at: Date.now(), byGuild, refreshing: null }; })
+            .catch(err => {
+                // Wait the usual interval before trying again rather than retrying on every keystroke
+                usage = { ...usage, at: Date.now(), refreshing: null };
+                log.error(`Emoji usage count failed: ${err.message}`);
+            });
+        return usage.refreshing;
+    }
+
+    function emojiUsage(guildId) {
+        if (Date.now() - usage.at > USAGE_REFRESH_MS) refreshUsage();
+        return usage.byGuild.get(guildId) ?? new Map();
+    }
+
+    function resolveEmoji(input, tracked) {
+        const name = input.trim().replace(/^:|:$/g, '').toLowerCase();
+        return tracked.find(e => e.key === parseEmoji(input).key)
+            ?? tracked.find(e => e.name.toLowerCase() === name);
+    }
+
+    function readFilters(interaction) {
+        const channel = interaction.options.getChannel('channel');
+        const content = interaction.options.getString('content') ?? 'all';
+        const period = PERIODS[interaction.options.getString('period')];
+        return {
+            channelId: channel?.id ?? null,
+            media: content === 'media' ? 1 : content === 'text' ? 0 : null,
+            since: period ? Date.now() - period.ms : null,
+            labels: [
+                channel && `#${channel.name}`,
+                content === 'media' && 'Media only',
+                content === 'text' && 'Text only',
+                period?.label
+            ]
+        };
+    }
+
+    const title = (emoji, name, labels) => [`${emoji.display} ${name}`, ...labels].filter(Boolean).join(' · ');
+
+    function leaderboardEmbed(interaction, emoji, f) {
+        const type = interaction.options.getString('type') ?? 'received';
+        const ranked = db.leaderboard(type, interaction.guildId, emoji.key, f.channelId, f.media, f.since);
+        const top = ranked.slice(0, TOP_N);
+
+        const myIndex = ranked.findIndex(r => r.user_id === interaction.user.id);
+        const verb = type === 'given' ? 'given' : 'received';
+        const myRank = myIndex === -1
+            ? `**Your rank:** none yet, you haven't ${verb} any ${emoji.display}`
+            : `**Your rank:** #${myIndex + 1} of ${ranked.length} — ${ranked[myIndex].total}`;
+
+        return new EmbedBuilder()
+            .setTitle(title(emoji, 'Leaderboard', [type === 'given' ? 'Given' : 'Received', ...f.labels]))
+            .setDescription(top.length
+                ? top.map((r, i) => `**${i + 1}.** <@${r.user_id}> — ${r.total}`).join('\n') + '\n\n' + myRank
+                : 'No reactions counted yet.');
+    }
+
+    // /topmessages replies that can still change page, by message ID: { page, pageCount, render }
+    const pagedReplies = new Map();
+
+    async function replyTopMessages(interaction, emoji, f, scanning) {
+        const user = interaction.options.getUser('user');
+        const userLabel = user && '@' + (interaction.options.getMember('user')?.displayName ?? user.username);
+        // Every page is fetched up front, so changing page needs no database work
+        const rows = db.topMessages(interaction.guildId, emoji.key, user?.id ?? null, f.channelId, f.media, f.since,
+            TOP_N * MAX_PAGES);
+        const pageCount = Math.max(1, Math.ceil(rows.length / TOP_N));
+        const heading = title(emoji, 'Top Messages', [userLabel, ...f.labels]);
+
+        // The channel name links to the message (keeps lines short enough not to wrap), and <t:time:d>
+        // renders as a date in the viewer's own format
+        const channelName = (id) => interaction.guild?.channels.cache.get(id)?.name ?? 'message';
+        const line = (r, i) => `**${i + 1}.** ${r.total} · <@${r.author_id}> · `
+            + `[#${channelName(r.channel_id)}](https://discord.com/channels/${interaction.guildId}/${r.channel_id}/${r.id}) · `
+            + `<t:${Math.floor(createdAt(r.id) / 1000)}:d>`;
+
+        // Once paging has ended the reply shows page 1 with no buttons or page number
+        const render = (page, ended = false) => {
+            const start = page * TOP_N;
+            const embed = new EmbedBuilder()
+                .setTitle(heading)
+                .setDescription(rows.length
+                    ? rows.slice(start, start + TOP_N).map((r, i) => line(r, start + i)).join('\n')
+                    : 'No messages found.');
+            const footer = [
+                pageCount > 1 && !ended && `Page ${page + 1}/${pageCount}`,
+                scanning && 'Still counting older messages, totals may change.'
+            ].filter(Boolean).join(' · ');
+            if (footer) embed.setFooter({ text: footer });
+
+            const components = pageCount > 1 && !ended ? [new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId('topmessages:prev').setLabel('Previous')
+                    .setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
+                new ButtonBuilder().setCustomId('topmessages:next').setLabel('Next')
+                    .setStyle(ButtonStyle.Secondary).setDisabled(page === pageCount - 1))] : [];
+
+            // Mentions in embeds don't notify anyway, but make sure the reply can never ping
+            return { embeds: [embed], components, allowedMentions: { parse: [] } };
+        };
+
+        const response = await interaction.reply({ ...render(0), withResponse: true });
+        if (pageCount === 1) return;
+
+        const messageId = response.resource.message.id;
+        pagedReplies.set(messageId, { page: 0, pageCount, render });
+        // The bot can only edit its reply for 15 minutes, so just before that it goes back to page 1
+        // and the buttons are removed
+        setTimeout(() => {
+            pagedReplies.delete(messageId);
+            interaction.editReply(render(0, true)).catch(() => {});
+        }, PAGE_BUTTONS_MS).unref();
+    }
+
+    async function changePage(interaction) {
+        const state = pagedReplies.get(interaction.message.id);
+        if (!state) {
+            // Expired, or from before a restart
+            await interaction.update({ components: [] });
+            return;
+        }
+        const step = interaction.customId === 'topmessages:next' ? 1 : -1;
+        state.page = Math.min(Math.max(state.page + step, 0), state.pageCount - 1);
+        await interaction.update(state.render(state.page));
+    }
 
     client.on(Events.InteractionCreate, async (interaction) => {
+        if (interaction.isButton() && interaction.customId.startsWith('topmessages:')) {
+            try {
+                await changePage(interaction);
+            } catch (err) {
+                log.error(`/topmessages page change failed: ${err.message}`);
+            }
+            return;
+        }
+
+        if (!COMMAND_NAMES.includes(interaction.commandName)) return;
         try {
-            if (interaction.isAutocomplete() && interaction.commandName === 'leaderboard') {
-                const typed = interaction.options.getFocused().replaceAll(':', '').toLowerCase();
-                const choices = getTracked()
-                    .filter(e => e.name.toLowerCase().includes(typed))
+            if (interaction.isAutocomplete()) {
+                const typed = interaction.options.getFocused().replaceAll(':', '').trim().toLowerCase();
+                // Only 25 suggestions fit: names starting with what was typed first, then the most used
+                const usage = emojiUsage(interaction.guildId);
+                const startsWith = (e) => e.name.toLowerCase().startsWith(typed) ? 0 : 1;
+                const choices = getTracked(interaction.guild)
+                    .filter(e => e.name.toLowerCase().includes(typed) || e.key.includes(typed))
+                    .sort((a, b) => startsWith(a) - startsWith(b) || (usage.get(b.key) ?? 0) - (usage.get(a.key) ?? 0))
                     .slice(0, 25)
-                    .map(e => ({ name: e.name, value: e.key }));
+                    .map(e => ({ name: e.label, value: e.key }));
                 await interaction.respond(choices);
                 return;
             }
 
-            if (!interaction.isChatInputCommand() || interaction.commandName !== 'leaderboard') return;
+            if (!interaction.isChatInputCommand()) return;
 
-            const input = interaction.options.getString('emoji');
-            const tracked = getTracked();
-            const name = input.trim().replace(/^:|:$/g, '').toLowerCase();
-            const emoji = tracked.find(e => e.key === parseEmoji(input).key)
-                ?? tracked.find(e => e.name.toLowerCase() === name);
-
+            const tracked = getTracked(interaction.guild);
+            const emoji = resolveEmoji(interaction.options.getString('emoji'), tracked);
             if (!emoji) {
-                const list = tracked.map(e => e.display).join(' ') || '(none configured)';
+                // Keep the reply under Discord's message length limit when every server emoji is tracked
+                const SHOWN = 40;
+                const list = tracked.slice(0, SHOWN).map(e => e.display).join(' ') || '(none configured)';
+                const more = tracked.length > SHOWN ? ` and ${tracked.length - SHOWN} more` : '';
                 await interaction.reply({
-                    content: `That emoji isn't on the leaderboard. Tracked emojis: ${list}`,
+                    content: `That emoji isn't tracked. Tracked emojis: ${list}${more}`,
                     flags: MessageFlags.Ephemeral
                 });
                 return;
             }
 
-            const type = interaction.options.getString('type') ?? 'received';
-            const channel = interaction.options.getChannel('channel');
-            const content = interaction.options.getString('content') ?? 'all';
-            const media = content === 'media' ? 1 : content === 'text' ? 0 : null;
+            const filters = readFilters(interaction);
+            const scanning = scanningGuilds.has(interaction.guildId) || db.hasPending(interaction.guildId, emoji.key);
 
-            const ranked = db.leaderboard(type, interaction.guildId, emoji.key, channel?.id ?? null, media);
-            const top = ranked.slice(0, TOP_N);
-
-            const myIndex = ranked.findIndex(r => r.user_id === interaction.user.id);
-            const verb = type === 'given' ? 'given' : 'received';
-            const myRank = myIndex === -1
-                ? `**Your rank:** none yet, you haven't ${verb} any ${emoji.display}`
-                : `**Your rank:** #${myIndex + 1} of ${ranked.length} — ${ranked[myIndex].total}`;
-
-            const filters = [
-                type === 'given' ? 'Given' : 'Received',
-                channel && `#${channel.name}`,
-                content === 'media' && 'Media only',
-                content === 'text' && 'Text only'
-            ].filter(Boolean).join(' · ');
-
-            const embed = new EmbedBuilder()
-                .setTitle(`${emoji.display} Leaderboard · ${filters}`)
-                .setDescription(top.length
-                    ? top.map((r, i) => `**${i + 1}.** <@${r.user_id}> — ${r.total}`).join('\n') + '\n\n' + myRank
-                    : 'No reactions counted yet.');
-
-            if (scanningGuilds.has(interaction.guildId) || db.hasPending(interaction.guildId, emoji.key)) {
-                embed.setFooter({ text: 'Still counting older messages, totals may change.' });
+            if (interaction.commandName === 'topmessages') {
+                await replyTopMessages(interaction, emoji, filters, scanning);
+                return;
             }
 
-            // Mentions in embeds don't notify anyway, but make sure the leaderboard can never ping
+            const embed = leaderboardEmbed(interaction, emoji, filters);
+            if (scanning) embed.setFooter({ text: 'Still counting older messages, totals may change.' });
+
+            // Mentions in embeds don't notify anyway, but make sure the reply can never ping
             await interaction.reply({ embeds: [embed], allowedMentions: { parse: [] } });
         } catch (err) {
-            log.error(`Leaderboard command failed: ${err.message}`);
+            log.error(`/${interaction.commandName} failed: ${err.message}`);
         }
     });
 };

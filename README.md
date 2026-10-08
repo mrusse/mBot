@@ -63,23 +63,30 @@ It will print an authorization URL. Open it in your browser, log into Spotify, t
 
 ## Reaction Leaderboard
 
-The bot keeps a leaderboard of who has received the most of certain reactions. Only emojis listed in `leaderboard-config.json` are tracked.
+The bot keeps leaderboards for the emojis chosen in `leaderboard-config.json`:
 
 ```json
 {
-    "emojis": ["upvote:123456789012345678", "downvote:123456789012345679"]
+    "allServerEmojis": true,
+    "emojis": ["fire:🔥", "❓"]
 }
 ```
 
-Custom emojis use the same `name:id` format as `ADDED_REACT` (animated ones look like `a:name:id`). They are matched by name (ignoring capitalisation), so every upload of `:upvote:`, including old re-uploads and copies from other servers, counts as the same emoji. The ID is only used to display the emoji. Changes to the file take effect without a restart.
+- `allServerEmojis`: tracks every custom emoji in the server, including ones uploaded later. Set it to `false` to only track the emojis listed below.
+- `emojis`: extra emojis to track, mainly standard ones like 🔥 (paste the emoji itself; in Discord, typing `\:fire:` and sending it gives the exact character). Optionally give one a name to search for it by, as `"fire:🔥"`. Custom emojis can be listed too, in the same `name:id` format as `ADDED_REACT` (animated ones look like `a:name:id`); with `allServerEmojis` on this is only needed for emojis from other servers that people use with Nitro.
 
-`/leaderboard <emoji> [type] [channel] [content]` shows the top 10 users for that reaction, plus the rank of whoever ran it. Anyone can use it, and the emoji field autocompletes from the configured list.
+Custom emojis are matched by name (ignoring capitalisation), so every upload of `:upvote:`, including old re-uploads and copies from other servers, counts as the same emoji. Changes to the file take effect without a restart.
+
+`/leaderboard <emoji> [type] [channel] [content] [period]` shows the top 10 users for that reaction, plus the rank of whoever ran it. Anyone can use it. The emoji field suggests tracked emojis, most used first; type part of a name to narrow it down.
 
 - `type`: **Received** (default) ranks people by reactions on their messages; **Given** ranks people by reactions they handed out.
 - `channel`: only count messages in one channel.
 - `content`: **Media only** (uploaded files, images, link previews and stickers) or **Text only**.
+- `period`: only count messages posted in the **Past day**, **week**, **month** or **year** (default: all time). This goes by when the message was posted, not when it was reacted to, since Discord doesn't record when reactions were added.
 
-Reactions from bots, reactions on bot messages, and reacting to your own message are not counted. Deleted messages drop off the leaderboard.
+`/topmessages <emoji> [user] [channel] [content] [period]` shows the messages with the most of that reaction, each with a link to jump to it, its author, channel and date. It shows 10 per page, up to 5 pages (top 50). Anyone can use the Previous/Next buttons for about 14 minutes, after which the reply goes back to page 1 and the buttons are removed. Pick a `user` to see only their messages (e.g. your own most-reacted posts); the other filters work the same as above.
+
+Reactions from bots, reactions on bot messages, and reacting to your own message are not counted. Each person counts once per message, even if they react with several different uploads of the same emoji (e.g. five different upvotes). Deleted messages drop off the leaderboard.
 
 ### How it's stored
 

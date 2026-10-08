@@ -1,8 +1,7 @@
 {
+    "allServerEmojis": true,
     "emojis": [
-        "upvote:123456789012345678",
-        "downvote:123456789012345679",
-        "a:partyparrot:123456789012345680",
-        "🔥"
+        "fire:🔥",
+        "❓"
     ]
 }

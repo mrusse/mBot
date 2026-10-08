@@ -18,7 +18,9 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMessageReactions
+        GatewayIntentBits.GuildMessageReactions,
+        // Keeps each server's emoji list up to date, for the leaderboard's allServerEmojis option
+        GatewayIntentBits.GuildExpressions
     ],
     // Reactions on messages sent before the bot started arrive as partials
     partials: [Partials.Message, Partials.Reaction, Partials.User]
