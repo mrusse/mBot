@@ -75,6 +75,34 @@ The bot keeps leaderboards for the emojis chosen in `leaderboard-config.json`:
 - `allServerEmojis`: tracks every custom emoji in the server, including ones uploaded later. Set it to `false` to only track the emojis listed below.
 - `emojis`: extra emojis to track, mainly standard ones like 🔥 (paste the emoji itself; in Discord, typing `\:fire:` and sending it gives the exact character). Optionally give one a name to search for it by, as `"fire:🔥"`. Custom emojis can be listed too, in the same `name:id` format as `ADDED_REACT` (animated ones look like `a:name:id`); with `allServerEmojis` on this is only needed for emojis from other servers that people use with Nitro.
 
+- `repostBots` (optional): bots that repost links on someone's behalf (e.g. to fix embeds). Reactions on their reposts are credited to the original poster instead of being ignored like other bots' messages:
+
+  ```json
+  "repostBots": [
+      { "bot": "LinkFixer", "format": "{username} ({displayname}) posted:" }
+  ]
+  ```
+
+  `bot` is the bot's name or, more reliably, its user ID (right-click it > Copy User ID). `format` is how its messages start: `{username}` marks the poster's Discord username and `{displayname}` marks text to skip.
+
+  If the bot's wording has changed over time, list every version under `formats` instead. They're tried in order and the first one naming a real member wins. A format can be limited to messages posted `before` or `after` a date (`YYYY-MM-DD`) so it can't be mistaken for another:
+
+  ```json
+  { "bot": "LinkFixer", "formats": [
+      { "format": "{username} ({displayname}) posted:", "after": "2024-05-12" },
+      "{username} posted:",
+      "{displayname} ({username}) posted:"
+  ] }
+  ```
+
+  Reposts naming someone who isn't a member aren't counted, and the bot logs the name. If they changed username since (e.g. in Discord's 2023 username change), add a top-level `usernameMap` from the old name to their current username or, more reliably, their user ID:
+
+  ```json
+  "usernameMap": { "coolguy99": "coolguy_2024", "pixelfrog": "123456789012345678" }
+  ```
+
+  This needs the **Server Members Intent**: in the [Discord Developer Portal](https://discord.com/developers/applications), open your app, go to **Bot**, and turn on **Server Members Intent** under **Privileged Gateway Intents**, then save. Adding or changing `repostBots` or `usernameMap` makes the bot rescan the message history once to find older reposts (restart the bot after editing it).
+
 Custom emojis are matched by name (ignoring capitalisation), so every upload of `:upvote:`, including old re-uploads and copies from other servers, counts as the same emoji. Changes to the file take effect without a restart.
 
 `/leaderboard <emoji> [type] [channel] [content] [period]` shows the top 10 users for that reaction, plus the rank of whoever ran it. Anyone can use it. The emoji field suggests tracked emojis, most used first; type part of a name to narrow it down.

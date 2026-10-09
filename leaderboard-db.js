@@ -54,6 +54,12 @@ const SCHEMA = `
         before     TEXT,
         done       INTEGER NOT NULL DEFAULT 0
     );
+
+    -- Small key/value store, e.g. which repost bot setup the message history was last scanned with
+    CREATE TABLE IF NOT EXISTS settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
 `;
 
 // What the config matches on: custom emojis by lowercase name, so every upload of an emoji with the
@@ -122,7 +128,7 @@ function openDatabase(file) {
     const q = Object.fromEntries(Object.entries({
         upsertMessage: `
             INSERT INTO messages (id, guild_id, channel_id, author_id, has_media) VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (id) DO UPDATE SET has_media = excluded.has_media`,
+            ON CONFLICT (id) DO UPDATE SET author_id = excluded.author_id, has_media = excluded.has_media`,
         deleteMessage: `DELETE FROM messages WHERE id = ?`,
         hasMessage: `SELECT 1 FROM messages WHERE id = ?`,
         setMedia: `UPDATE messages SET has_media = 1 WHERE id = ?`,
@@ -146,6 +152,8 @@ function openDatabase(file) {
         clearReactors: `DELETE FROM reactors WHERE message_id = ? AND emoji = ?`,
         countReactors: `SELECT COUNT(*) AS n FROM reactors WHERE message_id = ? AND emoji = ?`,
         refreshCounted: `UPDATE reactions SET counted = (${COUNTED}) WHERE message_id = ? AND emoji = ?`,
+        refreshCountedForMessage: `UPDATE reactions SET counted = (${COUNTED}) WHERE message_id = ? AND reactors_fetched = 1`,
+        authorOf: `SELECT author_id FROM messages WHERE id = ?`,
 
         upsertUser: `INSERT INTO users (id, bot) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET bot = excluded.bot`,
 
@@ -153,6 +161,9 @@ function openDatabase(file) {
         saveChannelScan: `
             INSERT INTO channel_scans (channel_id, guild_id, before, done) VALUES (?, ?, ?, ?)
             ON CONFLICT (channel_id) DO UPDATE SET before = excluded.before, done = excluded.done`,
+        restartChannelScans: `UPDATE channel_scans SET before = NULL, done = 0`,
+        getSetting: `SELECT value FROM settings WHERE key = ?`,
+        setSetting: `INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
 
         pendingChannels: `
             SELECT m.channel_id, COUNT(*) AS n
@@ -228,13 +239,18 @@ function openDatabase(file) {
 
     // Stores a message and the counts of every emoji on it. Reaction lists that are still accurate
     // (same count as before) are kept; changed ones are marked for another who-reacted lookup.
+    // authorId is who gets credit: normally the author, but the original poster for a repost bot's message.
     // Call inside a transaction.
-    function storeMessage(message) {
+    function storeMessage(message, authorId = message.author.id) {
         if (!message.reactions.cache.size) {
             q.deleteMessage.run(message.id);
             return;
         }
-        q.upsertMessage.run(message.id, message.guildId, message.channelId, message.author.id, hasMedia(message) ? 1 : 0);
+        const previousAuthor = q.authorOf.get(message.id)?.author_id;
+        q.upsertMessage.run(message.id, message.guildId, message.channelId, authorId, hasMedia(message) ? 1 : 0);
+        // A repost credited to someone else now (e.g. after fixing a repost bot format): self-reactions are
+        // judged against the author, so recount the reactions already looked up
+        if (previousAuthor && previousAuthor !== authorId) q.refreshCountedForMessage.run(message.id);
 
         const stale = new Map(q.reactionsOf.all(message.id).map(r => [r.emoji, r.count]));
         for (const reaction of message.reactions.cache.values()) {
@@ -338,6 +354,10 @@ function openDatabase(file) {
         channelScan: (channelId) => q.channelScan.get(channelId) ?? { before: null, done: 0 },
         saveChannelScan: (channelId, guildId, before, done) =>
             q.saveChannelScan.run(channelId, guildId, before ?? null, done ? 1 : 0),
+        // Makes every channel's message scan start again from the newest message; stored data is kept
+        restartChannelScans: () => q.restartChannelScans.run(),
+        getSetting: (key) => q.getSetting.get(key)?.value ?? null,
+        setSetting: (key, value) => q.setSetting.run(key, value),
 
         pendingChannels: (guildId, keys) => q.pendingChannels.all(guildId, JSON.stringify(keys)),
         pendingInChannel: (channelId, keys, limit) => q.pendingInChannel.all(JSON.stringify(keys), channelId, limit),

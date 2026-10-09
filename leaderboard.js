@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const {
     ActionRowBuilder,
+    GatewayIntentBits,
     ButtonBuilder,
     ButtonStyle,
     ChannelType,
@@ -102,20 +103,79 @@ const formatDuration = (ms) => {
     return mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`;
 };
 
+// Repost bots (e.g. one that reposts links with better embeds) post on someone else's behalf. Each config
+// entry names the bot (username or user ID) and how its messages start, where {username} marks the
+// original poster's username and {displayname} marks text to skip, e.g. "{username} ({displayname}) posted:".
+// A bot whose wording has changed over time can list several "formats"; they're tried in order and the
+// first one naming a real member wins. A format can be limited to messages posted "before" or "after" a
+// date (YYYY-MM-DD) if its wording could be mistaken for another's.
+function compileFormat(format) {
+    if (!format?.includes('{username}')) throw new Error(`repostBots format "${format}" needs {username}`);
+    const pattern = format.split(/(\{username\}|\{displayname\})/).map(part =>
+        // Anything but brackets: pre-2023 usernames could contain spaces and quotes
+        part === '{username}' ? '(?<username>[^()]+?)'
+            : part === '{displayname}' ? '.*?'
+                : part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('');
+    return new RegExp('^' + pattern, 'i');
+}
+
+function parseDate(date) {
+    if (date === undefined) return null;
+    const ms = Date.parse(date);
+    if (Number.isNaN(ms)) throw new Error(`repostBots date "${date}" isn't a valid YYYY-MM-DD date`);
+    return ms;
+}
+
+function parseRepostBots(entries) {
+    return entries.map(({ bot, format, formats = format ? [format] : [] }) => {
+        if (!bot || !formats.length) throw new Error('each repostBots entry needs a "bot" and a "format" or "formats"');
+        return {
+            bot: String(bot).toLowerCase(),
+            formats: formats.map(f => typeof f === 'string'
+                ? { regex: compileFormat(f), before: null, after: null }
+                : { regex: compileFormat(f.format), before: parseDate(f.before), after: parseDate(f.after) })
+        };
+    });
+}
+
+// Reads the repost bot setup straight from the file, for app.js to decide its gateway intents at startup
+function configuredRepostBots() {
+    try {
+        return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')).repostBots ?? [];
+    } catch {
+        return [];
+    }
+}
+
 module.exports = function setupLeaderboard(client, log) {
-    let config = { mtime: 0, listed: [], allServerEmojis: false, lastError: null };
+    let config = {
+        mtime: 0, listed: [], allServerEmojis: false, repostBots: [], usernameMap: new Map(), repostSetup: '[]', lastError: null
+    };
 
     // Re-read the config whenever the file changes, so edits apply without a restart
     function loadConfig() {
         try {
             const { mtimeMs } = fs.statSync(CONFIG_PATH);
             if (mtimeMs !== config.mtime) {
-                const { emojis = [], allServerEmojis = false } = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-                config = { mtime: mtimeMs, listed: emojis.map(parseEmoji), allServerEmojis: allServerEmojis === true, lastError: null };
+                const { emojis = [], allServerEmojis = false, repostBots = [], usernameMap = {} } =
+                    JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+                const hasMap = Object.keys(usernameMap).length > 0;
+                config = {
+                    mtime: mtimeMs,
+                    listed: emojis.map(parseEmoji),
+                    allServerEmojis: allServerEmojis === true,
+                    repostBots: parseRepostBots(repostBots),
+                    // Old usernames shown in reposts -> the person's current username or user ID
+                    usernameMap: new Map(Object.entries(usernameMap).map(([from, to]) => [from.toLowerCase(), String(to).toLowerCase()])),
+                    // Compared with the setup history was last scanned with, to know when to rescan
+                    repostSetup: JSON.stringify(hasMap ? { repostBots, usernameMap } : repostBots),
+                    lastError: null
+                };
                 const listed = config.listed.map(e => e.name).join(', ');
                 log.info('Leaderboard tracking: ' + (config.allServerEmojis
                     ? 'all server emojis' + (listed ? ` + ${listed}` : '')
                     : listed || '(none)'));
+                if (repostBots.length) log.info(`Repost bots: ${repostBots.map(b => b.bot).join(', ')}`);
             }
         } catch (err) {
             if (err.message !== config.lastError) {
@@ -141,6 +201,49 @@ module.exports = function setupLeaderboard(client, log) {
             if (!tracked.has(e.key)) tracked.set(e.key, e);
         }
         return [...tracked.values()];
+    }
+
+    // Set once the member list is loaded, which matching repost bot usernames needs
+    let membersLoaded = false;
+    let warnedRestartNeeded = false;
+    // Usernames from repost bot messages that matched no member, so each is only logged once
+    const unmatchedUsernames = new Set();
+
+    // Who gets credit for a message: its author, or for a repost bot's message the member it names.
+    // Returns null for other bots' messages, and for reposts whose poster isn't a member (e.g. they left,
+    // or changed username since).
+    function creditedAuthor(message) {
+        if (!message.author.bot) return message.author.id;
+        const names = [message.author.id, message.author.username, message.author.globalName]
+            .filter(Boolean).map(n => n.toLowerCase());
+        const { repostBots, usernameMap } = loadConfig();
+        const bot = repostBots.find(b => names.includes(b.bot));
+        if (!bot || !message.content) return null;
+
+        // Try each format that applies to when the message was posted; the first naming a member wins
+        const posted = createdAt(message.id);
+        const tried = [];
+        for (const { regex, before, after } of bot.formats) {
+            if ((before !== null && posted >= before) || (after !== null && posted < after)) continue;
+            const username = message.content.match(regex)?.groups.username;
+            if (!username) continue;
+            // Reposts from before Discord's 2023 username change may show an old name#1234 tag
+            const name = username.toLowerCase().replace(/#\d{4}$/, '');
+            if (!tried.includes(name)) tried.push(name);
+            // usernameMap points old usernames at someone's current username or user ID
+            const target = usernameMap.get(name) ?? name;
+            const member = message.guild?.members.cache.get(target)
+                ?? message.guild?.members.cache.find(m => m.user.username.toLowerCase() === target);
+            if (member) return member.id;
+        }
+
+        const key = tried.join(' / ');
+        if (key && !unmatchedUsernames.has(key)) {
+            unmatchedUsernames.add(key);
+            log.warn(`Repost bot: no member with the username ${tried.map(n => `"${n}"`).join(' or ')}, `
+                + 'so their reposts aren\'t counted (add the old name to usernameMap if they changed username)');
+        }
+        return null;
     }
 
     const db = openDatabase(DB_PATH);
@@ -174,10 +277,11 @@ module.exports = function setupLeaderboard(client, log) {
             // otherwise this is its first reaction, so store it now
             if (!added) return;
             const full = message.partial ? await message.fetch() : message;
-            if (full.author.bot) return;
+            const authorId = creditedAuthor(full);
+            if (!authorId) return;
 
             db.transaction(() => {
-                db.storeMessage(full);
+                db.storeMessage(full, authorId);
                 db.markSoleReactor(full.id, reaction.emoji, user.id);
             });
 
@@ -270,7 +374,11 @@ module.exports = function setupLeaderboard(client, log) {
                 const saveStarted = Date.now();
                 db.transaction(() => {
                     for (const message of batch.values()) {
-                        if (!message.author.bot && message.reactions.cache.size) db.storeMessage(message);
+                        if (!message.reactions.cache.size) continue;
+                        const authorId = creditedAuthor(message);
+                        if (authorId) db.storeMessage(message, authorId);
+                        // A repost credited under an earlier repost bot setup that no longer matches anyone
+                        else if (message.author.bot) db.deleteMessage(message.id);
                     }
                     db.saveChannelScan(channel.id, guild.id, before, done);
                 });
@@ -402,6 +510,24 @@ module.exports = function setupLeaderboard(client, log) {
         try {
             do {
                 scanQueued = false;
+
+                // Bot messages were skipped by earlier scans, so a new or changed repost bot setup needs the
+                // message history read again to find their reposts. Stored data is kept.
+                const { repostBots, repostSetup } = loadConfig();
+                if ((db.getSetting('repostBots') ?? '[]') !== repostSetup) {
+                    if (!repostBots.length) {
+                        // Nothing new to find. Reposts already stored stay credited.
+                        db.setSetting('repostBots', repostSetup);
+                    } else if (!membersLoaded) {
+                        if (!warnedRestartNeeded) log.warn('Repost bot setup changed: restart the bot to apply it');
+                        warnedRestartNeeded = true;
+                    } else {
+                        log.info('Repost bot setup changed: rescanning message history to find their reposts');
+                        db.restartChannelScans();
+                        db.setSetting('repostBots', repostSetup);
+                    }
+                }
+
                 for (const guild of client.guilds.cache.values()) {
                     const textChannels = [...guild.channels.cache.values()]
                         .filter(c => SCANNED_CHANNEL_TYPES.includes(c.type));
@@ -460,6 +586,15 @@ module.exports = function setupLeaderboard(client, log) {
             log.info('Leaderboard slash commands registered');
         } catch (err) {
             log.error(`Failed to register slash commands: ${err.message}`);
+        }
+        // Matching repost bot usernames to members needs the full member list
+        if (loadConfig().repostBots.length) {
+            try {
+                await Promise.all(client.guilds.cache.map(guild => guild.members.fetch()));
+                membersLoaded = true;
+            } catch (err) {
+                log.error(`Could not load the member list for repost bots: ${err.message}`);
+            }
         }
         // Usage totals decide the lookup order, so get them before the first scan
         await refreshUsage();
@@ -662,3 +797,7 @@ module.exports = function setupLeaderboard(client, log) {
         }
     });
 };
+
+// The Server Members intent is only requested when repost bots are configured, since it's a privileged
+// intent that has to be switched on in the Discord Developer Portal first
+module.exports.extraIntents = () => configuredRepostBots().length ? [GatewayIntentBits.GuildMembers] : [];

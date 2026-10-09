@@ -20,7 +20,9 @@ const client = new Client({
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildMessageReactions,
         // Keeps each server's emoji list up to date, for the leaderboard's allServerEmojis option
-        GatewayIntentBits.GuildExpressions
+        GatewayIntentBits.GuildExpressions,
+        // Server Members, when the leaderboard has repost bots configured
+        ...setupLeaderboard.extraIntents()
     ],
     // Reactions on messages sent before the bot started arrive as partials
     partials: [Partials.Message, Partials.Reaction, Partials.User]
@@ -236,4 +238,11 @@ async function addToPlaylist(token, trackUri) {
     });
 }
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN).catch((err) => {
+    log.error(`Login failed: ${err.message}`);
+    if (/disallowed intents/i.test(err.message)) {
+        log.error('repostBots in leaderboard-config.json needs the Server Members Intent. Turn it on in the '
+            + 'Discord Developer Portal (your app > Bot > Privileged Gateway Intents), or remove repostBots.');
+    }
+    process.exit(1);
+});
