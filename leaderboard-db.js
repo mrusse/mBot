@@ -42,6 +42,10 @@ const SCHEMA = `
         FOREIGN KEY (message_id, emoji) REFERENCES reactions (message_id, emoji) ON DELETE CASCADE
     );
 
+    -- /profile looks up one person's messages and the reactions they gave
+    CREATE INDEX IF NOT EXISTS messages_author ON messages (guild_id, author_id);
+    CREATE INDEX IF NOT EXISTS reactors_user ON reactors (user_id);
+
     CREATE TABLE IF NOT EXISTS users (
         id  TEXT PRIMARY KEY,
         bot INTEGER NOT NULL
@@ -187,6 +191,10 @@ function openDatabase(file) {
         hasPending: `
             SELECT 1 FROM reactions r JOIN messages m ON m.id = r.message_id
             WHERE m.guild_id = ? AND r.match_key = ? AND r.reactors_fetched = 0
+            LIMIT 1`,
+        hasPendingAny: `
+            SELECT 1 FROM reactions r JOIN messages m ON m.id = r.message_id
+            WHERE m.guild_id = ? AND r.reactors_fetched = 0 AND r.match_key IN (SELECT value FROM json_each(?))
             LIMIT 1`,
 
         received: `
@@ -371,7 +379,9 @@ function openDatabase(file) {
         // The messages with the most of an emoji; authorId limits it to one person's messages, or null
         topMessages(guildId, key, authorId, channelId, media, since, limit) {
             return q.topMessages.all(guildId, key, authorId, authorId, channelId, channelId, media, media, since, since, limit);
-        }
+        },
+
+        hasPendingAny: (guildId, keys) => !!q.hasPendingAny.get(guildId, JSON.stringify(keys))
     };
 }
 
@@ -386,29 +396,66 @@ const USAGE = `
     GROUP BY r.match_key
 `;
 
-// Runs in a worker thread with its own read-only connection, so adding up every reaction doesn't stall
-// the bot. SQLite lets it read while the bot keeps writing.
-const USAGE_WORKER = `
+// One person's messages, with how much each tracked emoji on them counts toward received
+const PROFILE_RECEIVED = `
+    SELECT m.id, m.channel_id, r.match_key, ${MESSAGE_RECEIVED} AS total
+    FROM reactions r JOIN messages m ON m.id = r.message_id
+    WHERE m.guild_id = ? AND m.author_id = ? AND r.match_key IN (SELECT value FROM json_each(?)) ${FILTERS}
+    GROUP BY m.id, r.match_key
+    HAVING total > 0
+`;
+
+// How many of each tracked emoji one person gave (at most once per message)
+const PROFILE_GIVEN = `
+    SELECT r.match_key, COUNT(DISTINCT x.message_id) AS total
+    FROM reactors x
+    JOIN reactions r ON r.message_id = x.message_id AND r.emoji = x.emoji
+    JOIN messages m ON m.id = x.message_id
+    WHERE x.user_id = ? AND m.guild_id = ? AND x.user_id != m.author_id
+      AND r.match_key IN (SELECT value FROM json_each(?)) ${FILTERS}
+    GROUP BY r.match_key
+    ORDER BY total DESC
+`;
+
+// Runs read-only queries in a worker thread with its own connection, so slow ones (adding up every
+// reaction, a heavy /profile) don't stall the bot. SQLite lets it read while the bot keeps writing.
+const QUERY_WORKER = `
     const { parentPort, workerData } = require('node:worker_threads');
     const { DatabaseSync } = require('node:sqlite');
     const db = new DatabaseSync(workerData.file, { readOnly: true });
-    const usage = db.prepare(workerData.sql);
-    parentPort.postMessage(workerData.guildIds.map(id => [id, usage.all(id).map(r => [r.match_key, r.total])]));
+    parentPort.postMessage(workerData.queries.map(({ sql, params }) =>
+        db.prepare(sql).all(...params).map(row => ({ ...row }))));
     db.close();
 `;
 
-// Resolves to a Map of guild ID -> Map of emoji key -> total reactions
-function usageInBackground(file, guildIds) {
+// Resolves to each query's rows, in order
+function queryInBackground(file, queries) {
     return new Promise((resolve, reject) => {
-        const worker = new Worker(USAGE_WORKER, {
+        const worker = new Worker(QUERY_WORKER, {
             eval: true,
-            workerData: { file, sql: USAGE, guildIds },
+            workerData: { file, queries },
             // node:sqlite prints an experimental warning each time a thread loads it
             execArgv: ['--no-warnings']
         });
-        worker.once('message', (rows) => resolve(new Map(rows.map(([id, totals]) => [id, new Map(totals)]))));
+        worker.once('message', resolve);
         worker.once('error', reject);
     });
 }
 
-module.exports = { openDatabase, emojiKey, hasMedia, createdAt, usageInBackground };
+// Resolves to a Map of guild ID -> Map of emoji key -> total reactions
+async function usageInBackground(file, guildIds) {
+    const results = await queryInBackground(file, guildIds.map(id => ({ sql: USAGE, params: [id] })));
+    return new Map(guildIds.map((id, i) => [id, new Map(results[i].map(r => [r.match_key, r.total]))]));
+}
+
+// Everything /profile shows for one person, over the given emoji keys and filters
+async function profileInBackground(file, guildId, userId, keys, channelId, media, since) {
+    const filters = [channelId, channelId, media, media, since, since];
+    const [received, given] = await queryInBackground(file, [
+        { sql: PROFILE_RECEIVED, params: [guildId, userId, JSON.stringify(keys), ...filters] },
+        { sql: PROFILE_GIVEN, params: [userId, guildId, JSON.stringify(keys), ...filters] }
+    ]);
+    return { received, given };
+}
+
+module.exports = { openDatabase, emojiKey, hasMedia, createdAt, usageInBackground, profileInBackground };

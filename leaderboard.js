@@ -14,7 +14,7 @@ const {
     Routes,
     SlashCommandBuilder
 } = require('discord.js');
-const { openDatabase, hasMedia, createdAt, usageInBackground } = require('./leaderboard-db');
+const { openDatabase, hasMedia, createdAt, usageInBackground, profileInBackground } = require('./leaderboard-db');
 
 const CONFIG_PATH = path.join(__dirname, 'leaderboard-config.json');
 const DB_PATH = path.join(__dirname, 'leaderboard.db');
@@ -77,7 +77,14 @@ const commands = [
         .addStringOption(emojiOption('The reaction to rank messages by'))
         .addUserOption(opt => opt
             .setName('user')
-            .setDescription("Only show this person's messages")))
+            .setDescription("Only show this person's messages"))),
+    addFilterOptions(new SlashCommandBuilder()
+        .setName('profile')
+        .setDescription("Show someone's reaction stats")
+        .setContexts(InteractionContextType.Guild)
+        .addUserOption(opt => opt
+            .setName('user')
+            .setDescription('Whose profile to show (default: you)')))
 ];
 const COMMAND_NAMES = commands.map(c => c.name);
 
@@ -669,6 +676,73 @@ module.exports = function setupLeaderboard(client, log) {
                 : 'No reactions counted yet.');
     }
 
+    async function replyProfile(interaction) {
+        // A profile adds up everything one person has received and given, which can take a few seconds on
+        // a big server. Discord drops replies after 3 seconds unless told the bot is working on it.
+        await interaction.deferReply();
+        const user = interaction.options.getUser('user') ?? interaction.user;
+        const member = interaction.options.getMember('user') ?? (user.id === interaction.user.id ? interaction.member : null);
+        const name = member?.displayName ?? user.globalName ?? user.username;
+        const f = readFilters(interaction);
+        const tracked = getTracked(interaction.guild);
+        const keys = tracked.map(e => e.key);
+        const display = new Map(tracked.map(e => [e.key, e.display]));
+        const { received, given } = await profileInBackground(DB_PATH, interaction.guildId, user.id, keys, f.channelId, f.media, f.since);
+
+        // received has one row per message per emoji, so add them up three ways
+        const byEmoji = new Map();
+        const byMessage = new Map();
+        const byChannel = new Map();
+        for (const r of received) {
+            byEmoji.set(r.match_key, (byEmoji.get(r.match_key) ?? 0) + r.total);
+            const msg = byMessage.get(r.id) ?? { channelId: r.channel_id, total: 0 };
+            msg.total += r.total;
+            byMessage.set(r.id, msg);
+            byChannel.set(r.channel_id, (byChannel.get(r.channel_id) ?? 0) + r.total);
+        }
+        const sum = (values) => [...values].reduce((a, b) => a + b, 0);
+        const receivedTotal = sum(byEmoji.values());
+        const givenTotal = sum(given.map(g => g.total));
+        const most = (map) => [...map].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0];
+        const n = (x) => x.toLocaleString('en-US');
+
+        const topEmojis = (pairs) => pairs.slice(0, 5).map(([key, total]) => `${display.get(key) ?? key} ${n(total)}`).join(' · ');
+        const receivedSorted = [...byEmoji].sort((a, b) => b[1] - a[1]);
+        const givenSorted = given.map(g => [g.match_key, g.total]);
+
+        const embed = new EmbedBuilder()
+            .setTitle(title({ display: '👤' }, `Profile · ${name}`, f.labels))
+            .setThumbnail(user.displayAvatarURL({ size: 128 }))
+            .addFields(
+                { name: 'Received', value: receivedTotal ? `**${n(receivedTotal)}**\n${topEmojis(receivedSorted)}` : 'None yet', inline: true },
+                { name: 'Given', value: givenTotal ? `**${n(givenTotal)}**\n${topEmojis(givenSorted)}` : 'None yet', inline: true }
+            );
+
+        if (receivedTotal && givenTotal) {
+            embed.addFields({ name: 'Ratio', value: `Gives ${(givenTotal / receivedTotal).toFixed(2)} for every 1 received` });
+        }
+        const topMessage = most(new Map([...byMessage].map(([id, m]) => [id, m.total])));
+        if (topMessage) {
+            const [id, total] = topMessage;
+            const channelId = byMessage.get(id).channelId;
+            const channelName = interaction.guild?.channels.cache.get(channelId)?.name ?? 'message';
+            embed.addFields({
+                name: 'Most reacted message',
+                value: `${n(total)} · [#${channelName}](https://discord.com/channels/${interaction.guildId}/${channelId}/${id}) · `
+                    + `<t:${Math.floor(createdAt(id) / 1000)}:d>`
+            });
+        }
+        const topChannel = most(byChannel);
+        if (topChannel) {
+            embed.addFields({ name: 'Top channel', value: `<#${topChannel[0]}> · ${n(topChannel[1])} received` });
+        }
+
+        if (scanningGuilds.has(interaction.guildId) || db.hasPendingAny(interaction.guildId, keys)) {
+            embed.setFooter({ text: 'Still counting older messages, totals may change.' });
+        }
+        await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+    }
+
     // /topmessages replies that can still change page, by message ID: { page, pageCount, render }
     const pagedReplies = new Map();
 
@@ -765,6 +839,11 @@ module.exports = function setupLeaderboard(client, log) {
 
             if (!interaction.isChatInputCommand()) return;
 
+            if (interaction.commandName === 'profile') {
+                await replyProfile(interaction);
+                return;
+            }
+
             const tracked = getTracked(interaction.guild);
             const emoji = resolveEmoji(interaction.options.getString('emoji'), tracked);
             if (!emoji) {
@@ -794,6 +873,7 @@ module.exports = function setupLeaderboard(client, log) {
             await interaction.reply({ embeds: [embed], allowedMentions: { parse: [] } });
         } catch (err) {
             log.error(`/${interaction.commandName} failed: ${err.message}`);
+            if (interaction.deferred) await interaction.editReply('Something went wrong, try again in a moment.').catch(() => {});
         }
     });
 };

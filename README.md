@@ -114,6 +114,8 @@ Custom emojis are matched by name (ignoring capitalisation), so every upload of 
 
 `/topmessages <emoji> [user] [channel] [content] [period]` shows the messages with the most of that reaction, each with a link to jump to it, its author, channel and date. It shows 10 per page, up to 5 pages (top 50). Anyone can use the Previous/Next buttons for about 14 minutes, after which the reply goes back to page 1 and the buttons are removed. Pick a `user` to see only their messages (e.g. your own most-reacted posts); the other filters work the same as above.
 
+`/profile [user] [channel] [content] [period]` shows someone's reaction stats (default: you): reactions received and given with their top emojis, how many they give for each one received, their most reacted message, and the channel they get the most reactions in.
+
 Reactions from bots, reactions on bot messages, and reacting to your own message are not counted. Each person counts once per message, even if they react with several different uploads of the same emoji (e.g. five different upvotes). Deleted messages drop off the leaderboard.
 
 ### How it's stored
