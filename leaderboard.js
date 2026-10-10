@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const {
     ActionRowBuilder,
+    AttachmentBuilder,
     GatewayIntentBits,
     ButtonBuilder,
     ButtonStyle,
@@ -14,7 +15,13 @@ const {
     Routes,
     SlashCommandBuilder
 } = require('discord.js');
-const { openDatabase, hasMedia, createdAt, usageInBackground, profileInBackground } = require('./leaderboard-db');
+const {
+    openDatabase, hasMedia, createdAt, usageInBackground, profileInBackground,
+    votesByMonthInBackground, votesByAuthorInBackground, votesByMessageInBackground,
+    votingHabitsInBackground, emojiByMonthInBackground
+} = require('./leaderboard-db');
+const { renderLineChart, emojiIconUrl } = require('./leaderboard-chart');
+const { wilson, spanOf, alignToMonths, runningTotal, rankHaters } = require('./leaderboard-stats');
 
 const CONFIG_PATH = path.join(__dirname, 'leaderboard-config.json');
 const DB_PATH = path.join(__dirname, 'leaderboard.db');
@@ -26,6 +33,10 @@ const SCAN_CONCURRENCY = 5;
 const READ_PERMS = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory];
 const SCANNED_CHANNEL_TYPES = [ChannelType.GuildText, ChannelType.GuildAnnouncement];
 
+const MIN_VOTES = 20;          // votes someone needs before /votes ranks their approval or habits
+const EMOJI_GRAPH_MAX = 10;    // lines on /emojigraph, as many as the chart palette has colours for
+const HABITS_REFRESH_MS = 10 * 60_000;
+
 const DAY = 24 * 60 * 60 * 1000;
 const PERIODS = {
     day: { label: 'Past day', ms: DAY },
@@ -34,8 +45,10 @@ const PERIODS = {
     year: { label: 'Past year', ms: 365 * DAY }
 };
 
-// Filters shared by /leaderboard and /topmessages
-const addFilterOptions = (command) => command
+// Filters shared by /leaderboard and /topmessages. The charts only offer periods long enough to span
+// several monthly points
+const CHART_PERIODS = ['year'];
+const addFilterOptions = (command, periods = Object.keys(PERIODS)) => command
     .addChannelOption(opt => opt
         .setName('channel')
         .setDescription('Only count messages in this channel')
@@ -51,7 +64,7 @@ const addFilterOptions = (command) => command
         .setName('period')
         .setDescription('Only count messages posted in this time period (default: all time)')
         .addChoices(
-            ...Object.entries(PERIODS).map(([value, { label }]) => ({ name: label, value })),
+            ...periods.map(value => ({ name: PERIODS[value].label, value })),
             { name: 'All time', value: 'all' }));
 
 const emojiOption = (description) => (opt) => opt
@@ -84,7 +97,58 @@ const commands = [
         .setContexts(InteractionContextType.Guild)
         .addUserOption(opt => opt
             .setName('user')
-            .setDescription('Whose profile to show (default: you)')))
+            .setDescription('Whose profile to show (default: you)'))),
+    addFilterOptions(new SlashCommandBuilder()
+        .setName('votegraph')
+        .setDescription('Chart upvotes, downvotes or score over time, by when the messages were posted')
+        .setContexts(InteractionContextType.Guild)
+        .addStringOption(opt => opt
+            .setName('mode')
+            .setDescription('What to chart (default: upvotes)')
+            .addChoices(
+                { name: 'Upvotes', value: 'up' },
+                { name: 'Downvotes', value: 'down' },
+                { name: 'Score (upvotes - downvotes)', value: 'score' }))
+        .addBooleanOption(opt => opt
+            .setName('cumulative')
+            .setDescription('Running total instead of per month (default: yes)'))
+        .addUserOption(opt => opt
+            .setName('user')
+            .setDescription("Only count this person's messages")), CHART_PERIODS),
+    addFilterOptions(new SlashCommandBuilder()
+        .setName('emojigraph')
+        .setDescription('Chart how often the most used emojis are used over time')
+        .setContexts(InteractionContextType.Guild)
+        .addUserOption(opt => opt
+            .setName('user')
+            .setDescription('Chart this person instead of the whole server'))
+        .addStringOption(opt => opt
+            .setName('type')
+            .setDescription("With a user: emojis they gave (default) or received")
+            .addChoices({ name: 'Given', value: 'given' }, { name: 'Received', value: 'received' }))
+        .addIntegerOption(opt => opt
+            .setName('count')
+            .setDescription(`How many emojis to chart (default: ${EMOJI_GRAPH_MAX})`)
+            .setMinValue(1)
+            .setMaxValue(EMOJI_GRAPH_MAX))
+        .addBooleanOption(opt => opt
+            .setName('cumulative')
+            .setDescription('Running total instead of per month (default: no)')), CHART_PERIODS),
+    addFilterOptions(new SlashCommandBuilder()
+        .setName('votes')
+        .setDescription('Rank people and messages by upvotes and downvotes')
+        .setContexts(InteractionContextType.Guild)
+        .addStringOption(opt => opt
+            .setName('view')
+            .setDescription('What to rank')
+            .setRequired(true)
+            .addChoices(
+                { name: 'Net score received', value: 'net' },
+                { name: 'Approval (best)', value: 'approval' },
+                { name: 'Harshest voters', value: 'harshest' },
+                { name: 'Kindest voters', value: 'kindest' },
+                { name: 'Best messages by net score', value: 'bestmessages' },
+                { name: 'Worst messages by net score', value: 'worstmessages' })))
 ];
 const COMMAND_NAMES = commands.map(c => c.name);
 
@@ -95,14 +159,14 @@ function parseEmoji(text) {
     const custom = trimmed.match(/^<?(?:(a):)?:?(\w+):(\d+)>?$/);
     if (custom) {
         const [, animated, name, id] = custom;
-        return { key: name.toLowerCase(), name, label: name, display: `<${animated ? 'a' : ''}:${name}:${id}>` };
+        return { key: name.toLowerCase(), name, id, label: name, display: `<${animated ? 'a' : ''}:${name}:${id}>` };
     }
     const named = trimmed.match(/^(\w+):(.+)$/u);
     if (named) {
         const [, name, emoji] = named;
-        return { key: emoji, name, label: `${emoji} ${name}`, display: emoji };
+        return { key: emoji, name, id: null, label: `${emoji} ${name}`, display: emoji };
     }
-    return { key: trimmed, name: trimmed, label: trimmed, display: trimmed };
+    return { key: trimmed, name: trimmed, id: null, label: trimmed, display: trimmed };
 }
 
 const formatDuration = (ms) => {
@@ -145,6 +209,18 @@ function parseRepostBots(entries) {
     });
 }
 
+// The upvote and downvote emojis, each a custom emoji given as name:id. Unlike the leaderboards they match
+// the exact emoji, not every upload sharing its name, because other servers have emojis with the same names
+function parseVoteEmojis(entry) {
+    if (!entry) return null;
+    const [up, down] = ['up', 'down'].map(side => {
+        const emoji = parseEmoji(String(entry[side] ?? ''));
+        if (!emoji.id) throw new Error(`voteEmojis "${side}" needs a custom emoji as name:id`);
+        return emoji;
+    });
+    return { up, down };
+}
+
 // Reads the repost bot setup straight from the file, for app.js to decide its gateway intents at startup
 function configuredRepostBots() {
     try {
@@ -156,7 +232,7 @@ function configuredRepostBots() {
 
 module.exports = function setupLeaderboard(client, log) {
     let config = {
-        mtime: 0, listed: [], allServerEmojis: false, repostBots: [], usernameMap: new Map(), repostSetup: '[]', lastError: null
+        mtime: 0, listed: [], allServerEmojis: false, repostBots: [], usernameMap: new Map(), repostSetup: '[]', voteEmojis: null, lastError: null
     };
 
     // Re-read the config whenever the file changes, so edits apply without a restart
@@ -164,7 +240,7 @@ module.exports = function setupLeaderboard(client, log) {
         try {
             const { mtimeMs } = fs.statSync(CONFIG_PATH);
             if (mtimeMs !== config.mtime) {
-                const { emojis = [], allServerEmojis = false, repostBots = [], usernameMap = {} } =
+                const { emojis = [], allServerEmojis = false, repostBots = [], usernameMap = {}, voteEmojis = null } =
                     JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
                 const hasMap = Object.keys(usernameMap).length > 0;
                 config = {
@@ -176,6 +252,7 @@ module.exports = function setupLeaderboard(client, log) {
                     usernameMap: new Map(Object.entries(usernameMap).map(([from, to]) => [from.toLowerCase(), String(to).toLowerCase()])),
                     // Compared with the setup history was last scanned with, to know when to rescan
                     repostSetup: JSON.stringify(hasMap ? { repostBots, usernameMap } : repostBots),
+                    voteEmojis: parseVoteEmojis(voteEmojis),
                     lastError: null
                 };
                 const listed = config.listed.map(e => e.name).join(', ');
@@ -605,6 +682,14 @@ module.exports = function setupLeaderboard(client, log) {
         }
         // Usage totals decide the lookup order, so get them before the first scan
         await refreshUsage();
+        // The first /profile or /votes shouldn't pay for adding up every vote
+        const vote = loadConfig().voteEmojis;
+        if (vote) {
+            for (const guild of client.guilds.cache.values()) {
+                votingHabits(guild.id, { channelId: null, media: null, since: null }, vote)
+                    .catch(err => log.error(`Voting habits lookup failed: ${err.message}`));
+            }
+        }
         runScans();
     });
 
@@ -687,7 +772,17 @@ module.exports = function setupLeaderboard(client, log) {
         const tracked = getTracked(interaction.guild);
         const keys = tracked.map(e => e.key);
         const display = new Map(tracked.map(e => [e.key, e.display]));
-        const { received, given } = await profileInBackground(DB_PATH, interaction.guildId, user.id, keys, f.channelId, f.media, f.since);
+        // If the habits lookup fails the profile still shows, minus the biggest hater
+        const vote = loadConfig().voteEmojis;
+        const [{ received, given, fans }, habits] = await Promise.all([
+            profileInBackground(DB_PATH, interaction.guildId, user.id, keys, f.channelId, f.media, f.since, vote),
+            (vote ? votingHabits(interaction.guildId, f, vote) : Promise.resolve([]))
+                .then(rows => new Map(rows.map(r => [r.user_id, r])))
+                .catch(err => {
+                    log.error(`Voting habits lookup failed: ${err.message}`);
+                    return new Map();
+                })
+        ]);
 
         // received has one row per message per emoji, so add them up three ways
         const byEmoji = new Map();
@@ -737,9 +832,234 @@ module.exports = function setupLeaderboard(client, log) {
             embed.addFields({ name: 'Top channel', value: `<#${topChannel[0]}> · ${n(topChannel[1])} received` });
         }
 
+        // Who votes on this person's messages
+        const topVoter = (isUp) => fans.filter(r => !!r.is_up === isUp).sort((a, b) => b.total - a.total)[0];
+        const fan = topVoter(true);
+        const downvoter = topVoter(false);
+        const hater = rankHaters(fans, habits)[0];
+        if (fan) embed.addFields({ name: 'Biggest fan', value: `<@${fan.user_id}> · ${n(fan.total)} upvotes`, inline: true });
+        if (downvoter) {
+            embed.addFields({ name: 'Most downvotes from', value: `<@${downvoter.user_id}> · ${n(downvoter.total)}`, inline: true });
+        }
+        if (hater && hater.lift > 1) {
+            embed.addFields({
+                name: 'Biggest hater',
+                value: `<@${hater.userId}> · ${n(hater.down)} downvotes, ${hater.lift.toFixed(1)}x their usual rate`,
+                inline: true
+            });
+        }
+
         if (scanningGuilds.has(interaction.guildId) || db.hasPendingAny(interaction.guildId, keys)) {
             embed.setFooter({ text: 'Still counting older messages, totals may change.' });
         }
+        await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+    }
+
+    // ---- vote charts and rankings ----
+
+    // Everyone's up and down votes given, which takes a few seconds to add up. Kept for a while per filter
+    // combination, but not with a period filter: its start moves with the clock, so it would never be reused
+    const habitsCache = new Map();
+
+    function votingHabits(guildId, f, vote) {
+        const run = () => votingHabitsInBackground(DB_PATH, guildId, vote, f.channelId, f.media, f.since);
+        if (f.since !== null) return run();
+        const key = `${guildId}|${vote.up.id}|${vote.down.id}|${f.channelId}|${f.media}`;
+        const hit = habitsCache.get(key);
+        if (hit && Date.now() - hit.at < HABITS_REFRESH_MS) return hit.promise;
+        const promise = run().catch(err => {
+            habitsCache.delete(key);
+            throw err;
+        });
+        habitsCache.set(key, { at: Date.now(), promise });
+        return promise;
+    }
+
+    const nameOf = (interaction, user) =>
+        interaction.options.getMember('user')?.displayName ?? user.globalName ?? user.username;
+
+    // The vote emojis from the config. Replies and returns null when they are not set up, so callers return
+    async function requireVotes(interaction) {
+        const vote = loadConfig().voteEmojis;
+        if (!vote) {
+            await interaction.reply({
+                content: 'The vote emojis are not set up. Add "voteEmojis" to the leaderboard config.',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+        return vote;
+    }
+
+    const isScanning = (guildId, keys) => scanningGuilds.has(guildId) || db.hasPendingAny(guildId, keys);
+
+    // Votes are placed on messages, so charts are by when the message was posted, not when it was voted on
+    async function sendChart(interaction, png, heading, extraFooter, keys) {
+        const embed = new EmbedBuilder()
+            .setTitle(heading)
+            .setImage('attachment://chart.png')
+            .setFooter({
+                text: [
+                    'By when each message was posted, not when it was voted on',
+                    extraFooter,
+                    isScanning(interaction.guildId, keys) && 'Still counting older messages, totals may change.'
+                ].filter(Boolean).join(' · ')
+            });
+        await interaction.editReply({
+            embeds: [embed],
+            files: [new AttachmentBuilder(png, { name: 'chart.png' })],
+            allowedMentions: { parse: [] }
+        });
+    }
+
+    const VOTE_MODES = {
+        up: { label: 'Upvotes', pick: r => r.up },
+        down: { label: 'Downvotes', pick: r => r.down },
+        score: { label: 'Score', pick: r => r.up - r.down }
+    };
+
+    async function replyVoteGraph(interaction) {
+        const vote = await requireVotes(interaction);
+        if (!vote) return;
+        await interaction.deferReply();
+        const modeKey = interaction.options.getString('mode') ?? 'up';
+        const mode = VOTE_MODES[modeKey];
+        const cumulative = interaction.options.getBoolean('cumulative') ?? true;
+        const user = interaction.options.getUser('user');
+        const f = readFilters(interaction);
+        const rows = await votesByMonthInBackground(DB_PATH, interaction.guildId, vote, user?.id ?? null,
+            f.channelId, f.media, f.since);
+        const months = spanOf(rows);
+        if (!months) {
+            await interaction.editReply('No votes found.');
+            return;
+        }
+        const values = alignToMonths(rows, months, mode.pick);
+        // Months can exist only because of the other vote type, which would chart a flat line of zeros
+        if (values.every(v => v === 0)) {
+            await interaction.editReply(`No ${mode.label.toLowerCase()} found.`);
+            return;
+        }
+        const icon = modeKey === 'score' ? null : emojiIconUrl(vote[modeKey].display);
+        const png = await renderLineChart({
+            title: [mode.label, cumulative ? 'running total' : 'per month', user && nameOf(interaction, user), ...f.labels]
+                .filter(Boolean).join(' - '),
+            labels: months,
+            series: [{
+                label: mode.label,
+                values: cumulative ? runningTotal(values) : values,
+                iconUrl: icon
+            }]
+        });
+        await sendChart(interaction, png, title({ display: '📈' }, 'Votes over time', []), null, [vote.up.key, vote.down.key]);
+    }
+
+    async function replyEmojiGraph(interaction) {
+        await interaction.deferReply();
+        const user = interaction.options.getUser('user');
+        // Without a user it is the server's totals, where given and received are the same reactions
+        const given = user ? (interaction.options.getString('type') ?? 'given') === 'given' : false;
+        const count = interaction.options.getInteger('count') ?? EMOJI_GRAPH_MAX;
+        const cumulative = interaction.options.getBoolean('cumulative') ?? false;
+        const f = readFilters(interaction);
+        const tracked = getTracked(interaction.guild);
+        const byKey = new Map(tracked.map(e => [e.key, e]));
+
+        // Server: the most used emojis by the totals the autocomplete already keeps. A person: their own
+        // most used, so every emoji is fetched and the busiest are picked from the totals
+        const used = emojiUsage(interaction.guildId);
+        const candidates = user ? [...byKey.keys()]
+            : [...byKey.keys()].sort((a, b) => (used.get(b) ?? 0) - (used.get(a) ?? 0)).slice(0, count);
+        const rows = await emojiByMonthInBackground(DB_PATH, interaction.guildId, candidates, given,
+            user?.id ?? null, f.channelId, f.media, f.since, loadConfig().voteEmojis);
+
+        const totals = new Map();
+        for (const r of rows) totals.set(r.match_key, (totals.get(r.match_key) ?? 0) + r.total);
+        const keys = [...totals.keys()].sort((a, b) => totals.get(b) - totals.get(a)).slice(0, count);
+        const months = spanOf(rows);
+        if (!months) {
+            await interaction.editReply('No reactions found.');
+            return;
+        }
+        const series = keys.map(key => {
+            const values = alignToMonths(rows.filter(r => r.match_key === key), months, r => r.total);
+            const emoji = byKey.get(key);
+            return {
+                label: emoji?.name ?? key,
+                values: cumulative ? runningTotal(values) : values,
+                iconUrl: emojiIconUrl(emoji?.display)
+            };
+        });
+        const who = user ? `${nameOf(interaction, user)} (${given ? 'given' : 'received'})` : 'Server';
+        const png = await renderLineChart({
+            title: ['Emoji use', cumulative ? 'running total' : 'per month', who, ...f.labels].filter(Boolean).join(' - '),
+            labels: months,
+            series
+        });
+        await sendChart(interaction, png, title({ display: '📊' }, 'Emoji over time', []), null, keys);
+    }
+
+    const per1000 = (down, votes) => (down / votes * 1000).toFixed(1);
+
+    async function replyVotes(interaction) {
+        const vote = await requireVotes(interaction);
+        if (!vote) return;
+        await interaction.deferReply();
+        const view = interaction.options.getString('view');
+        const f = readFilters(interaction);
+        const n = (x) => x.toLocaleString('en-US');
+        const keys = [vote.up.key, vote.down.key];
+        const sign = (x) => x > 0 ? `+${n(x)}` : n(x);
+        let heading;
+        let lines;
+        let footer = null;
+        // Approval and both voter rankings are ordered by the Wilson bound
+        const explainer = ['approval', 'harshest', 'kindest'].includes(view)
+            ? 'Explaining the Wilson bound (i.e. why things are ordered like this): http://alecbenzer.com/blog/how-to-sort-ratings/'
+            : null;
+
+        if (view === 'bestmessages' || view === 'worstmessages') {
+            const rows = await votesByMessageInBackground(DB_PATH, view === 'worstmessages', interaction.guildId,
+                vote, f.channelId, f.media, f.since, TOP_N);
+            const channelName = (id) => interaction.guild?.channels.cache.get(id)?.name ?? 'message';
+            heading = view === 'bestmessages' ? 'Best messages by net score' : 'Worst messages by net score';
+            lines = rows.map((r, i) => `**${i + 1}.** ${sign(r.net)} (${n(r.up)} up, ${n(r.down)} down) · <@${r.author_id}> · `
+                + `[#${channelName(r.channel_id)}](https://discord.com/channels/${interaction.guildId}/${r.channel_id}/${r.id}) · `
+                + `<t:${Math.floor(createdAt(r.id) / 1000)}:d>`);
+        } else if (view === 'net' || view === 'approval') {
+            const rows = await votesByAuthorInBackground(DB_PATH, interaction.guildId, vote, f.channelId, f.media, f.since);
+            if (view === 'net') {
+                heading = 'Net score received';
+                lines = rows.map(r => ({ ...r, net: r.up - r.down })).filter(r => r.net !== 0)
+                    .sort((a, b) => b.net - a.net).slice(0, TOP_N)
+                    .map((r, i) => `**${i + 1}.** <@${r.author_id}> — ${sign(r.net)} (${n(r.up)} up, ${n(r.down)} down)`);
+            } else {
+                heading = 'Approval';
+                lines = rows.filter(r => r.up + r.down >= MIN_VOTES)
+                    .sort((a, b) => wilson(b.up, b.up + b.down)[0] - wilson(a.up, a.up + a.down)[0]).slice(0, TOP_N)
+                    .map((r, i) => `**${i + 1}.** <@${r.author_id}> — ${per1000(r.down, r.up + r.down)} down per 1,000 votes `
+                        + `(${n(r.up)} up, ${n(r.down)} down)`);
+                footer = `At least ${MIN_VOTES} votes to be ranked`;
+            }
+        } else {
+            const rows = (await votingHabits(interaction.guildId, f, vote))
+                .map(r => ({ ...r, votes: r.up_given + r.down_given }))
+                .filter(r => r.votes >= MIN_VOTES);
+            const harshest = view === 'harshest';
+            heading = harshest ? 'Harshest voters' : 'Kindest voters';
+            // Ranked by how sure we are of the rate: the low end for harsh, the high end for kind
+            const rank = (r) => harshest ? -wilson(r.down_given, r.votes)[0] : wilson(r.down_given, r.votes)[1];
+            lines = rows.sort((a, b) => rank(a) - rank(b)).slice(0, TOP_N)
+                .map((r, i) => `**${i + 1}.** <@${r.user_id}> — ${per1000(r.down_given, r.votes)} down per 1,000 votes `
+                    + `(${n(r.up_given)} up, ${n(r.down_given)} down given)`);
+            footer = `At least ${MIN_VOTES} votes to be ranked`;
+        }
+
+        const footerText = [footer, isScanning(interaction.guildId, keys) && 'Still counting older messages, totals may change.']
+            .filter(Boolean).join(' · ');
+        const embed = new EmbedBuilder()
+            .setTitle(title({ display: '🗳️' }, heading, f.labels))
+            .setDescription((lines.length ? lines.join('\n') : 'Nothing to rank yet.') + (explainer ? `\n\n${explainer}` : ''));
+        if (footerText) embed.setFooter({ text: footerText });
         await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
     }
 
@@ -841,6 +1161,12 @@ module.exports = function setupLeaderboard(client, log) {
 
             if (interaction.commandName === 'profile') {
                 await replyProfile(interaction);
+                return;
+            }
+            // These have no emoji option, so they are handled before the emoji lookup below
+            const voteCommand = { votegraph: replyVoteGraph, emojigraph: replyEmojiGraph, votes: replyVotes }[interaction.commandName];
+            if (voteCommand) {
+                await voteCommand(interaction);
                 return;
             }
 

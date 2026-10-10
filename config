@@ -1,0 +1,34 @@
+{
+    "allServerEmojis": true,
+    "emojis": [
+        "question:❓",
+        "eyes:👀",
+        "fire:🔥",
+        "skull:💀",
+        "thumbs_up:👍",
+        "nodding_head:🙂‍↕️",
+        "shaking_head:🙂‍↔️",
+        "sob:😭",
+        "nauseated:🤢",
+        "eye_roll:🙄",
+        "butter:🧈",
+        "salute:🫡",
+        "nerd:🤓",
+        "heart_eyes:😍",
+        "recycle:♻️"
+    ],
+    "repostBots": [
+        { "bot": "Twotter", "formats": [
+            { "format": "{username} ({displayname}) posted:", "after": "2024-05-12" },
+            "{username} posted:",
+            "{displayname} ({username}) posted:"
+        ] }
+    ]
+    "usernameMap": {
+      "mitch": "mitch.zip",
+      "guava": "thesimpleguava",
+      "hydrocity": "aquaticruin",
+      "json": "of.the",
+      "james\"pfd\"mcgee": "peaeffdee"
+    }
+}
