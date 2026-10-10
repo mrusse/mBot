@@ -21,7 +21,9 @@ const {
     votingHabitsInBackground, emojiByMonthInBackground
 } = require('./leaderboard-db');
 const { renderLineChart, emojiIconUrl } = require('./leaderboard-chart');
-const { wilson, spanOf, alignToMonths, runningTotal, rankHaters } = require('./leaderboard-stats');
+const {
+    wilson, spanOf, alignToMonths, runningTotal, rankHaters, parseMonth, trimMonths, ratioSeries
+} = require('./leaderboard-stats');
 
 const CONFIG_PATH = path.join(__dirname, 'leaderboard-config.json');
 const DB_PATH = path.join(__dirname, 'leaderboard.db');
@@ -48,6 +50,15 @@ const PERIODS = {
 // Filters shared by /leaderboard and /topmessages. The charts only offer periods long enough to span
 // several monthly points
 const CHART_PERIODS = ['year'];
+
+// A window for the charts, by month, on top of the filters above
+const addWindowOptions = (command) => command
+    .addStringOption(opt => opt
+        .setName('from')
+        .setDescription('First month to include, like 2024 or 2024-03'))
+    .addStringOption(opt => opt
+        .setName('to')
+        .setDescription('Last month to include, like 2025 or 2025-06'));
 const addFilterOptions = (command, periods = Object.keys(PERIODS)) => command
     .addChannelOption(opt => opt
         .setName('channel')
@@ -98,7 +109,7 @@ const commands = [
         .addUserOption(opt => opt
             .setName('user')
             .setDescription('Whose profile to show (default: you)'))),
-    addFilterOptions(new SlashCommandBuilder()
+    addWindowOptions(addFilterOptions(new SlashCommandBuilder()
         .setName('votegraph')
         .setDescription('Chart upvotes, downvotes or score over time, by when the messages were posted')
         .setContexts(InteractionContextType.Guild)
@@ -109,13 +120,19 @@ const commands = [
                 { name: 'Upvotes', value: 'up' },
                 { name: 'Downvotes', value: 'down' },
                 { name: 'Score (upvotes - downvotes)', value: 'score' }))
+        .addStringOption(opt => opt
+            .setName('per')
+            .setDescription('Average per message instead of a total (default: no)')
+            .addChoices(
+                { name: 'Per message with a reaction', value: 'messages' },
+                { name: 'Per message with an upvote or downvote', value: 'voted' }))
         .addBooleanOption(opt => opt
             .setName('cumulative')
             .setDescription('Running total instead of per month (default: yes)'))
         .addUserOption(opt => opt
             .setName('user')
-            .setDescription("Only count this person's messages")), CHART_PERIODS),
-    addFilterOptions(new SlashCommandBuilder()
+            .setDescription("Only count this person's messages")), CHART_PERIODS)),
+    addWindowOptions(addFilterOptions(new SlashCommandBuilder()
         .setName('emojigraph')
         .setDescription('Chart how often the most used emojis are used over time')
         .setContexts(InteractionContextType.Guild)
@@ -133,7 +150,7 @@ const commands = [
             .setMaxValue(EMOJI_GRAPH_MAX))
         .addBooleanOption(opt => opt
             .setName('cumulative')
-            .setDescription('Running total instead of per month (default: no)')), CHART_PERIODS),
+            .setDescription('Running total instead of per month (default: no)')), CHART_PERIODS)),
     addFilterOptions(new SlashCommandBuilder()
         .setName('votes')
         .setDescription('Rank people and messages by upvotes and downvotes')
@@ -911,6 +928,26 @@ module.exports = function setupLeaderboard(client, log) {
         });
     }
 
+    // The from and to options as YYYY-MM, or replies and returns null when one isn't a date or they are
+    // the wrong way round
+    async function readWindow(interaction) {
+        const given = (name) => interaction.options.getString(name);
+        const from = given('from') === null ? null : parseMonth(given('from'), false);
+        const to = given('to') === null ? null : parseMonth(given('to'), true);
+        const bad = (given('from') !== null && !from) || (given('to') !== null && !to) || (from && to && from > to);
+        if (bad) {
+            await interaction.reply({
+                content: 'Dates need to look like 2024 or 2024-03, and "from" cannot be after "to".',
+                flags: MessageFlags.Ephemeral
+            });
+            return null;
+        }
+        return { from, to, label: from || to ? `${from ?? 'start'} to ${to ?? 'now'}` : null };
+    }
+
+    // What "per" divides by, as it reads in a title
+    const PER_LABELS = { messages: 'message with a reaction', voted: 'message with a vote' };
+
     const VOTE_MODES = {
         up: { label: 'Upvotes', pick: r => r.up },
         down: { label: 'Downvotes', pick: r => r.down },
@@ -920,40 +957,48 @@ module.exports = function setupLeaderboard(client, log) {
     async function replyVoteGraph(interaction) {
         const vote = await requireVotes(interaction);
         if (!vote) return;
+        const window = await readWindow(interaction);
+        if (!window) return;
         await interaction.deferReply();
         const modeKey = interaction.options.getString('mode') ?? 'up';
         const mode = VOTE_MODES[modeKey];
+        const per = interaction.options.getString('per');
         const cumulative = interaction.options.getBoolean('cumulative') ?? true;
         const user = interaction.options.getUser('user');
         const f = readFilters(interaction);
-        const rows = await votesByMonthInBackground(DB_PATH, interaction.guildId, vote, user?.id ?? null,
-            f.channelId, f.media, f.since);
+        // Cutting the window here, before anything is added up, makes a running total start at zero in it
+        const rows = trimMonths(await votesByMonthInBackground(DB_PATH, interaction.guildId, vote, user?.id ?? null,
+            f.channelId, f.media, f.since), window.from, window.to);
         const months = spanOf(rows);
         if (!months) {
             await interaction.editReply('No votes found.');
             return;
         }
-        const values = alignToMonths(rows, months, mode.pick);
+        const totals = alignToMonths(rows, months, mode.pick);
         // Months can exist only because of the other vote type, which would chart a flat line of zeros
-        if (values.every(v => v === 0)) {
+        if (totals.every(v => v === 0)) {
             await interaction.editReply(`No ${mode.label.toLowerCase()} found.`);
             return;
         }
+        const divisors = per && alignToMonths(rows, months, r => per === 'voted' ? r.voted : r.messages);
+        const values = per ? ratioSeries(totals, divisors, cumulative) : cumulative ? runningTotal(totals) : totals;
         const icon = modeKey === 'score' ? null : emojiIconUrl(vote[modeKey].display);
+        const shape = per ? (cumulative ? 'running average' : 'per month') : (cumulative ? 'running total' : 'per month');
         const png = await renderLineChart({
-            title: [mode.label, cumulative ? 'running total' : 'per month', user && nameOf(interaction, user), ...f.labels]
-                .filter(Boolean).join(' - '),
+            title: [per ? `${mode.label} per ${PER_LABELS[per]}` : mode.label, shape, user && nameOf(interaction, user),
+                window.label, ...f.labels].filter(Boolean).join(' - '),
             labels: months,
-            series: [{
-                label: mode.label,
-                values: cumulative ? runningTotal(values) : values,
-                iconUrl: icon
-            }]
+            series: [{ label: mode.label, values, iconUrl: icon }]
         });
-        await sendChart(interaction, png, title({ display: '📈' }, 'Votes over time', []), null, [vote.up.key, vote.down.key]);
+        // Messages with no reaction aren't stored, so that average is over fewer messages than were sent
+        await sendChart(interaction, png, title({ display: '📈' }, 'Votes over time', []),
+            per === 'messages' && 'Only messages with a reaction are stored, not every message sent',
+            [vote.up.key, vote.down.key]);
     }
 
     async function replyEmojiGraph(interaction) {
+        const window = await readWindow(interaction);
+        if (!window) return;
         await interaction.deferReply();
         const user = interaction.options.getUser('user');
         // Without a user it is the server's totals, where given and received are the same reactions
@@ -969,8 +1014,8 @@ module.exports = function setupLeaderboard(client, log) {
         const used = emojiUsage(interaction.guildId);
         const candidates = user ? [...byKey.keys()]
             : [...byKey.keys()].sort((a, b) => (used.get(b) ?? 0) - (used.get(a) ?? 0)).slice(0, count);
-        const rows = await emojiByMonthInBackground(DB_PATH, interaction.guildId, candidates, given,
-            user?.id ?? null, f.channelId, f.media, f.since, loadConfig().voteEmojis);
+        const rows = trimMonths(await emojiByMonthInBackground(DB_PATH, interaction.guildId, candidates, given,
+            user?.id ?? null, f.channelId, f.media, f.since, loadConfig().voteEmojis), window.from, window.to);
 
         const totals = new Map();
         for (const r of rows) totals.set(r.match_key, (totals.get(r.match_key) ?? 0) + r.total);
@@ -991,7 +1036,8 @@ module.exports = function setupLeaderboard(client, log) {
         });
         const who = user ? `${nameOf(interaction, user)} (${given ? 'given' : 'received'})` : 'Server';
         const png = await renderLineChart({
-            title: ['Emoji use', cumulative ? 'running total' : 'per month', who, ...f.labels].filter(Boolean).join(' - '),
+            title: ['Emoji use', cumulative ? 'running total' : 'per month', who, window.label, ...f.labels]
+                .filter(Boolean).join(' - '),
             labels: months,
             series
         });

@@ -447,9 +447,22 @@ const VOTES_PER_MESSAGE = `
 const UP_SUM = `SUM(CASE WHEN is_up THEN total ELSE 0 END)`;
 const DOWN_SUM = `SUM(CASE WHEN is_up THEN 0 ELSE total END)`;
 
+// voted: messages that got at least one counted upvote or downvote, the divisor for score per voted
+// message. A message with both has a row for each, hence the DISTINCT.
 const VOTES_BY_MONTH = `
-    SELECT month, ${UP_SUM} AS up, ${DOWN_SUM} AS down
+    SELECT month, ${UP_SUM} AS up, ${DOWN_SUM} AS down,
+           COUNT(DISTINCT CASE WHEN total > 0 THEN id END) AS voted
     FROM (${VOTES_PER_MESSAGE}) GROUP BY month ORDER BY month
+`;
+
+// Stored messages per month. Only messages with at least one reaction are stored, so this is not how many
+// messages were sent, and it is the divisor for score per message with a reaction.
+// Params: guildId, authorId (twice, null for everyone), then the filters
+const MESSAGES_BY_MONTH = `
+    SELECT ${POSTED_MONTH} AS month, COUNT(*) AS messages
+    FROM messages m
+    WHERE m.guild_id = ? AND (? IS NULL OR m.author_id = ?) ${FILTERS}
+    GROUP BY month
 `;
 
 const VOTES_BY_AUTHOR = `
@@ -579,12 +592,21 @@ async function profileInBackground(file, guildId, userId, keys, channelId, media
     return { received, given, fans };
 }
 
-// Votes received per month; authorId limits it to one person's messages, or null
-const votesByMonthInBackground = async (file, guildId, vote, authorId, channelId, media, since) =>
-    (await queryInBackground(file, [{
-        sql: VOTES_BY_MONTH,
-        params: votesParams(vote, guildId, authorId, filterParams(channelId, media, since))
-    }]))[0];
+// Votes received per month, with how many messages got a vote and how many have any reaction; authorId
+// limits it to one person's messages, or null. A month can appear with messages but no votes
+async function votesByMonthInBackground(file, guildId, vote, authorId, channelId, media, since) {
+    const filters = filterParams(channelId, media, since);
+    const [votes, messages] = await queryInBackground(file, [
+        { sql: VOTES_BY_MONTH, params: votesParams(vote, guildId, authorId, filters) },
+        { sql: MESSAGES_BY_MONTH, params: [guildId, authorId, authorId, ...filters] }
+    ]);
+    const byMonth = new Map(votes.map(r => [r.month, { ...r, messages: 0 }]));
+    for (const { month, messages: count } of messages) {
+        const row = byMonth.get(month) ?? { month, up: 0, down: 0, voted: 0 };
+        byMonth.set(month, { ...row, messages: count });
+    }
+    return [...byMonth.values()].sort((a, b) => a.month < b.month ? -1 : 1);
+}
 
 // Votes received per author
 const votesByAuthorInBackground = async (file, guildId, vote, channelId, media, since) =>

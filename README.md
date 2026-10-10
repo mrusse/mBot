@@ -4,6 +4,7 @@ A Discord bot for fun music stuff (and a bit more) in your server:
 
 - **Shared playlist**: when someone runs `.np` or `.fm`, mBot grabs the song [.fmbot](https://fmbot.xyz/) reports and adds it to a Spotify playlist.
 - **Reaction leaderboards**: `/leaderboard` ranks who has received or given the most of any emoji you choose to track.
+- **Vote stats**: `/votegraph`, `/emojigraph` and `/votes` chart and rank upvotes, downvotes and emoji use over time.
 
 ## Discord Bot Setup
 
@@ -68,13 +69,15 @@ The bot keeps leaderboards for the emojis chosen in `leaderboard-config.json`:
 ```json
 {
     "allServerEmojis": true,
-    "emojis": ["fire:🔥", "❓"]
+    "emojis": ["fire:🔥", "❓"],
+    "voteEmojis": { "up": "upvote:123456789012345678", "down": "downvote:123456789012345678" }
 }
 ```
 
 - `allServerEmojis`: tracks every custom emoji in the server, including ones uploaded later. Set it to `false` to only track the emojis listed below.
 - `emojis`: extra emojis to track, mainly standard ones like 🔥 (paste the emoji itself; in Discord, typing `\:fire:` and sending it gives the exact character). Optionally give one a name to search for it by, as `"fire:🔥"`. Custom emojis can be listed too, in the same `name:id` format as `ADDED_REACT` (animated ones look like `a:name:id`); with `allServerEmojis` on this is only needed for emojis from other servers that people use with Nitro.
 
+- `voteEmojis` (optional): the upvote and downvote emojis that the vote stats commands use, each as a custom emoji in the same `name:id` format. These match the exact emoji, not every upload with the same name, so lookalikes from other servers don't count. Without it, `/votegraph` and `/votes` say they aren't set up and `/profile` leaves out its vote fields. They should also be tracked (`allServerEmojis`, or listed above), or their received counts stay approximate until who reacted is looked up
 - `repostBots` (optional): bots that repost links on someone's behalf (e.g. to fix embeds). Reactions on their reposts are credited to the original poster instead of being ignored like other bots' messages:
 
   ```json
@@ -103,7 +106,7 @@ The bot keeps leaderboards for the emojis chosen in `leaderboard-config.json`:
 
   This needs the **Server Members Intent**: in the [Discord Developer Portal](https://discord.com/developers/applications), open your app, go to **Bot**, and turn on **Server Members Intent** under **Privileged Gateway Intents**, then save. Adding or changing `repostBots` or `usernameMap` makes the bot rescan the message history once to find older reposts (restart the bot after editing it).
 
-Custom emojis are matched by name (ignoring capitalisation), so every upload of `:upvote:`, including old re-uploads and copies from other servers, counts as the same emoji. Changes to the file take effect without a restart.
+Custom emojis are matched by name (ignoring capitalisation), so every upload of `:upvote:`, including old re-uploads and copies from other servers, counts as the same emoji. The exception is `voteEmojis`, which match the exact emoji. That means `/leaderboard upvote` (by name) can show slightly higher totals than `/votes` (exact). Changes to the file take effect without a restart.
 
 `/leaderboard <emoji> [type] [channel] [content] [period]` shows the top 10 users for that reaction, plus the rank of whoever ran it. Anyone can use it. The emoji field suggests tracked emojis, most used first; type part of a name to narrow it down.
 
@@ -114,9 +117,37 @@ Custom emojis are matched by name (ignoring capitalisation), so every upload of 
 
 `/topmessages <emoji> [user] [channel] [content] [period]` shows the messages with the most of that reaction, each with a link to jump to it, its author, channel and date. It shows 10 per page, up to 5 pages (top 50). Anyone can use the Previous/Next buttons for about 14 minutes, after which the reply goes back to page 1 and the buttons are removed. Pick a `user` to see only their messages (e.g. your own most-reacted posts); the other filters work the same as above.
 
-`/profile [user] [channel] [content] [period]` shows someone's reaction stats (default: you): reactions received and given with their top emojis, how many they give for each one received, their most reacted message, and the channel they get the most reactions in.
+`/profile [user] [channel] [content] [period]` shows someone's reaction stats (default: you): reactions received and given with their top emojis, how many they give for each one received, their most reacted message, and the channel they get the most reactions in. With `voteEmojis` set it also shows their biggest fan (most upvotes on their messages), who has downvoted them the most, and their biggest hater: the person who downvotes them the most compared to how often that person downvotes everyone else. So someone who downvotes everybody a lot doesn't win just for being harsh.
 
 Reactions from bots, reactions on bot messages, and reacting to your own message are not counted. Each person counts once per message, even if they react with several different uploads of the same emoji (e.g. five different upvotes). Deleted messages drop off the leaderboard.
+
+### Vote stats
+
+These need `voteEmojis` in the config. Anyone can use them, and they take the same `channel` and `content` filters as above.
+
+`/votegraph [mode] [per] [cumulative] [user] [from] [to] [channel] [content] [period]` draws a line chart of votes over time.
+
+- `mode`: **Upvotes** (default), **Downvotes** or **Score** (upvotes minus downvotes)
+- `per`: show an average instead of a total, either **per message with a reaction** or **per message with an upvote or downvote**. With `cumulative` on it is the average so far, otherwise each month's own average. A month with no messages to divide by is left as a gap
+- `cumulative`: a running total (default) or the amount per month
+- `user`: only count that person's messages
+- `from` and `to`: only chart the months between them, written as `2024` or `2024-03` (a bare year means its first month for `from` and its last for `to`). A running total starts from zero at the first month shown
+- `period`: only **Past year** or all time, since shorter periods would leave a line with one or two points
+
+`/emojigraph [user] [type] [count] [cumulative] [from] [to] [channel] [content] [period]` draws the most used emojis over time, with the emoji images in the legend. For the whole server it picks the most used emojis. With a `user` it picks that person's own most used, and `type` chooses emojis they **Gave** (default) or **Received**. `count` is how many lines to draw (1 to 10, default 10), and `cumulative` defaults to off here.
+
+`/votes <view> [channel] [content] [period]` ranks people or messages. `view` is one of:
+
+- **Net score received**: upvotes minus downvotes on someone's messages
+- **Approval (best)**: who gets the smallest share of downvotes, ranked by the Wilson bound so that a few clean votes don't beat a lot of mostly clean ones
+- **Harshest voters** and **Kindest voters**: the share of the votes someone gives that are downvotes, ranked the same way
+- **Best messages** and **Worst messages**: by net score, with a link to each
+
+Approval and the voter rankings only include people with at least 20 votes, and show downvotes per 1,000 votes rather than a percentage because nearly everyone is above 99% approved.
+
+The charts go by when each message was posted, not when it was voted on, since Discord doesn't record when reactions were added. The last month on a chart is usually partial, so the line drops at the right edge. The charts are drawn on the bot's machine with the `canvas` package and use its system fonts, and emoji images come from Discord's CDN. A machine with no fonts installed may draw charts without text (not tested). Standard emojis have no image, so they show as a coloured dot and their name.
+
+Only messages with at least one reaction are stored, so there is no count of every message someone sent. That is why `per` divides by messages with a reaction or with a vote, and why the first of those is an average over fewer messages than were really sent. Early months with only a few messages make the monthly averages jumpy, and the running average settles down as messages add up.
 
 ### How it's stored
 
