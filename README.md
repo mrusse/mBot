@@ -132,7 +132,7 @@ These need `voteEmojis` in the config. Anyone can use them, and they take the sa
 
 `/votegraph [mode] [per] [cumulative] [user] [user2] [average] [from] [to] [channel] [content] [period]` draws a line chart of votes over time.
 
-- `mode`: **Upvotes** (default), **Downvotes** or **Score** (upvotes minus downvotes)
+- `mode`: **Score** (default, upvotes minus downvotes), **Upvotes** or **Downvotes**
 - `per`: show an average instead of a total, either **per message with a reaction** or **per message with an upvote or downvote**. With `cumulative` on it is the average so far, otherwise each month's own average. A month with no messages to divide by is left as a gap
 - `cumulative`: a running total (default) or the amount per month
 - `user`: only count that person's messages
@@ -152,9 +152,22 @@ These need `voteEmojis` in the config. Anyone can use them, and they take the sa
 
 Approval and the voter rankings only include people with at least 20 votes, and show downvotes per 1,000 votes rather than a percentage because nearly everyone is above 99% approved.
 
+`/channels [sort] [channel] [content] [period]` ranks channels, top 10 by default sorted by net score. `sort` is one of:
+
+- **Net score**, **Upvotes** and **Downvotes**
+- **Approval (best)**: ranked by the Wilson bound, for channels with at least 100 votes
+- **Score per message with a reaction**: for channels with at least 50 messages
+- **Most controversial**: the share of messages with a vote that got both an upvote and a downvote, for channels with at least 50 such messages
+- **Most messages with a reaction** and **Most people posting**
+- **Highest share with media**: the share of messages with uploads, images, link previews or stickers
+- **Media vs text edge**: how much more or less score per message with a vote the media messages get, for channels with at least 25 of each
+- **Trending**: the score of the last 12 months against the 12 before, for channels that scored at least 100 in the earlier year. It looks at two whole years, so it can't be combined with `period`
+
+Here `channel` doesn't filter. Pick one and you get that channel in detail instead of a ranking: its score and rank, approval, how many messages got a vote and how many have media, score per message, media against text, how controversial it is, who posts and who upvotes there most, its trend and best month, its best and worst messages, and its most used emojis. Every channel is still counted so it can be ranked against the others.
+
 The charts go by when each message was posted, not when it was voted on, since Discord doesn't record when reactions were added. The last month on a chart is usually partial, so the line drops at the right edge. The charts are drawn on the bot's machine with the `canvas` package and use its system fonts, and emoji images come from Discord's CDN. A machine with no fonts installed may draw charts without text (not tested). Standard emojis have no image, so they show as a coloured dot and their name.
 
-Only messages with at least one reaction are stored, so there is no count of every message someone sent. That is why `per` divides by messages with a reaction or with a vote, and why the first of those is an average over fewer messages than were really sent. Early months with only a few messages make the monthly averages jumpy, and the running average settles down as messages add up.
+Only messages with at least one reaction are stored, so there is no count of every message someone sent or every message in a channel. That is why `per` divides by messages with a reaction or with a vote, why the first of those is an average over fewer messages than were really sent, and why `/channels` shows "messages with a reaction" and not how busy a channel is. Early months with only a few messages make the monthly averages jumpy, and the running average settles down as messages add up.
 
 ### How it's stored
 

@@ -438,7 +438,7 @@ const POSTED_MONTH = `strftime('%Y-%m', ((CAST(m.id AS INTEGER) >> 22) + ${DISCO
 // those too. A message can only hold one row per emoji, so there is nothing to merge.
 // Params: upId, guildId, upId, downId, authorId (twice, null for everyone), then the filters
 const VOTES_PER_MESSAGE = `
-    SELECT m.id, m.channel_id, m.author_id, ${POSTED_MONTH} AS month,
+    SELECT m.id, m.channel_id, m.author_id, m.has_media, ${POSTED_MONTH} AS month,
            r.emoji = ? AS is_up, ${RECEIVED} AS total
     FROM reactions r JOIN messages m ON m.id = r.message_id
     WHERE m.guild_id = ? AND r.emoji IN (?, ?) AND (? IS NULL OR m.author_id = ?) ${FILTERS}
@@ -479,6 +479,50 @@ const votesByMessage = (having, order) => `
 `;
 const BEST_MESSAGES = votesByMessage('net > 0', 'DESC');
 const WORST_MESSAGES = votesByMessage('net < 0', 'ASC');
+
+// Per channel: votes, how many messages got a vote or both kinds, and the same split by media against text.
+// Params as VOTES_PER_MESSAGE with a null author
+const CHANNEL_STATS = `
+    SELECT channel_id, SUM(up) AS up, SUM(down) AS down,
+           SUM(up > 0 OR down > 0) AS voted,
+           SUM(up > 0 AND down > 0) AS both_votes,
+           SUM(CASE WHEN has_media THEN up - down ELSE 0 END) AS media_score,
+           SUM(CASE WHEN has_media AND (up > 0 OR down > 0) THEN 1 ELSE 0 END) AS media_voted,
+           SUM(CASE WHEN has_media THEN 0 ELSE up - down END) AS text_score,
+           SUM(CASE WHEN has_media THEN 0 WHEN up > 0 OR down > 0 THEN 1 ELSE 0 END) AS text_voted
+    FROM (
+        SELECT id, channel_id, has_media,
+               SUM(CASE WHEN is_up THEN total ELSE 0 END) AS up,
+               SUM(CASE WHEN is_up THEN 0 ELSE total END) AS down
+        FROM (${VOTES_PER_MESSAGE}) GROUP BY id
+    )
+    GROUP BY channel_id
+`;
+
+// Stored messages per channel, how many have media, and how many people posted them. Only messages with a
+// reaction are stored, so these are not message counts for the channel.
+// Params: guildId, then the filters
+const CHANNEL_MESSAGES = `
+    SELECT m.channel_id, COUNT(*) AS messages, SUM(m.has_media) AS media, COUNT(DISTINCT m.author_id) AS authors
+    FROM messages m
+    WHERE m.guild_id = ? ${FILTERS}
+    GROUP BY m.channel_id
+`;
+
+// Votes per channel per month, for trends and peaks. Params as VOTES_PER_MESSAGE with a null author
+const CHANNEL_MONTHS = `
+    SELECT channel_id, month, ${UP_SUM} AS up, ${DOWN_SUM} AS down
+    FROM (${VOTES_PER_MESSAGE}) GROUP BY channel_id, month
+`;
+
+// Every emoji used on the messages that pass the filters, most used first. Raw counts, as USAGE has them.
+// Params: guildId, then the filters
+const EMOJIS_USED = `
+    SELECT r.match_key, SUM(r.count) AS total
+    FROM reactions r JOIN messages m ON m.id = r.message_id
+    WHERE m.guild_id = ? ${FILTERS}
+    GROUP BY r.match_key ORDER BY total DESC LIMIT 12
+`;
 
 // Who votes on one person's messages, and how often. CROSS JOIN pins the join order so SQLite starts
 // from that person's messages (messages_author); left to itself it starts from every vote in the
@@ -630,6 +674,39 @@ const votingHabitsInBackground = async (file, guildId, vote, channelId, media, s
         params: [vote.up.id, vote.down.id, guildId, vote.up.id, vote.down.id, ...filterParams(channelId, media, since)]
     }]))[0];
 
+// Every channel's numbers in one worker: the totals per channel (with the messages and people behind them)
+// and the votes per channel per month. A channel can have messages but no votes, or the reverse
+async function channelStatsInBackground(file, guildId, vote, media, since) {
+    const filters = filterParams(null, media, since);
+    const [stats, messages, months] = await queryInBackground(file, [
+        { sql: CHANNEL_STATS, params: votesParams(vote, guildId, null, filters) },
+        { sql: CHANNEL_MESSAGES, params: [guildId, ...filters] },
+        { sql: CHANNEL_MONTHS, params: votesParams(vote, guildId, null, filters) }
+    ]);
+    const blank = { up: 0, down: 0, voted: 0, both_votes: 0, media_score: 0, media_voted: 0, text_score: 0, text_voted: 0,
+        messages: 0, media: 0, authors: 0 };
+    const byChannel = new Map();
+    for (const r of [...messages, ...stats]) {
+        byChannel.set(r.channel_id, { ...blank, ...byChannel.get(r.channel_id), ...r });
+    }
+    return { channels: [...byChannel.values()], months };
+}
+
+// What one channel's breakdown needs beyond the totals above: who posts and who votes in it, its best and
+// worst messages, and its most used emojis
+async function channelDetailInBackground(file, guildId, vote, channelId, media, since) {
+    const filters = filterParams(channelId, media, since);
+    const voteParams = votesParams(vote, guildId, null, filters);
+    const [authors, voters, best, worst, emojis] = await queryInBackground(file, [
+        { sql: VOTES_BY_AUTHOR, params: voteParams },
+        { sql: HABITS, params: [vote.up.id, vote.down.id, guildId, vote.up.id, vote.down.id, ...filters] },
+        { sql: BEST_MESSAGES, params: [...voteParams, 1] },
+        { sql: WORST_MESSAGES, params: [...voteParams, 1] },
+        { sql: EMOJIS_USED, params: [guildId, ...filters] }
+    ]);
+    return { authors, voters, best: best[0] ?? null, worst: worst[0] ?? null, emojis };
+}
+
 // Emoji use per month. given = what personId reacted with; otherwise what personId's messages received
 // (null for everyone's). vote is optional, see ONLY_EXACT_VOTES
 async function emojiByMonthInBackground(file, guildId, keys, given, personId, channelId, media, since, vote = null) {
@@ -644,5 +721,5 @@ async function emojiByMonthInBackground(file, guildId, keys, given, personId, ch
 module.exports = {
     openDatabase, emojiKey, hasMedia, createdAt, usageInBackground, profileInBackground,
     votesByMonthInBackground, votesByAuthorInBackground, votesByMessageInBackground,
-    votingHabitsInBackground, emojiByMonthInBackground
+    votingHabitsInBackground, emojiByMonthInBackground, channelStatsInBackground, channelDetailInBackground
 };

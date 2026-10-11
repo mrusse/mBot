@@ -18,11 +18,11 @@ const {
 const {
     openDatabase, hasMedia, createdAt, usageInBackground, profileInBackground,
     votesByMonthInBackground, votesByAuthorInBackground, votesByMessageInBackground,
-    votingHabitsInBackground, emojiByMonthInBackground
+    votingHabitsInBackground, emojiByMonthInBackground, channelStatsInBackground, channelDetailInBackground
 } = require('./leaderboard-db');
 const { renderLineChart, emojiIconUrl } = require('./leaderboard-chart');
 const {
-    wilson, spanOf, alignToMonths, runningTotal, rankHaters, rankFans, pickTop, parseMonth, trimMonths, ratioSeries,
+    wilson, spanOf, alignToMonths, runningTotal, rankHaters, rankFans, pickTop, parseMonth, trimMonths, ratioSeries, trendOf, peakMonth,
     MIN_HATER_TOTAL_DOWNVOTES, MIN_FAN_TOTAL_UPVOTES
 } = require('./leaderboard-stats');
 
@@ -37,6 +37,11 @@ const READ_PERMS = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMes
 const SCANNED_CHANNEL_TYPES = [ChannelType.GuildText, ChannelType.GuildAnnouncement];
 
 const AVERAGE_COLOUR = '#80848e'; // the average user's dashed line, grey so it never reads as a person
+const WILSON_EXPLAINER = 'Explaining the Wilson bound (i.e. why things are ordered like this): http://alecbenzer.com/blog/how-to-sort-ratings/';
+const MIN_CHANNEL_VOTES = 100;     // votes a channel needs before /channels ranks its approval
+const MIN_CHANNEL_MESSAGES = 50;   // messages (with a reaction, or a vote) before /channels ranks an average or a share
+const MIN_MEDIA_GROUP = 25;        // media and text messages with a vote a channel needs for the media edge
+const MIN_TREND_PRIOR = 100;       // score in the year before, below which a trend ratio is just noise
 const MIN_VOTES = 20;          // votes someone needs before /votes ranks their approval or habits
 const EMOJI_GRAPH_MAX = 10;    // lines on /emojigraph, as many as the chart palette has colours for
 const HABITS_REFRESH_MS = 10 * 60_000;
@@ -61,10 +66,10 @@ const addWindowOptions = (command) => command
     .addStringOption(opt => opt
         .setName('to')
         .setDescription('Last month to include, like 2025 or 2025-06'));
-const addFilterOptions = (command, periods = Object.keys(PERIODS)) => command
+const addFilterOptions = (command, periods = Object.keys(PERIODS), channelDescription = 'Only count messages in this channel') => command
     .addChannelOption(opt => opt
         .setName('channel')
-        .setDescription('Only count messages in this channel')
+        .setDescription(channelDescription)
         .addChannelTypes(...SCANNED_CHANNEL_TYPES))
     .addStringOption(opt => opt
         .setName('content')
@@ -85,6 +90,20 @@ const emojiOption = (description) => (opt) => opt
     .setDescription(description)
     .setRequired(true)
     .setAutocomplete(true);
+
+const CHANNEL_SORT_CHOICES = [
+    { name: 'Net score', value: 'score' },
+    { name: 'Upvotes', value: 'upvotes' },
+    { name: 'Downvotes', value: 'downvotes' },
+    { name: 'Approval (best)', value: 'approval' },
+    { name: 'Score per message with a reaction', value: 'average' },
+    { name: 'Most controversial', value: 'controversy' },
+    { name: 'Most messages with a reaction', value: 'messages' },
+    { name: 'Most people posting', value: 'posters' },
+    { name: 'Highest share with media', value: 'media' },
+    { name: 'Media vs text edge', value: 'mediaedge' },
+    { name: 'Trending (last 12 months vs the 12 before)', value: 'trending' }
+];
 
 const commands = [
     addFilterOptions(new SlashCommandBuilder()
@@ -117,11 +136,11 @@ const commands = [
         .setContexts(InteractionContextType.Guild)
         .addStringOption(opt => opt
             .setName('mode')
-            .setDescription('What to chart (default: upvotes)')
+            .setDescription('What to chart (default: score)')
             .addChoices(
+                { name: 'Score (upvotes - downvotes)', value: 'score' },
                 { name: 'Upvotes', value: 'up' },
-                { name: 'Downvotes', value: 'down' },
-                { name: 'Score (upvotes - downvotes)', value: 'score' }))
+                { name: 'Downvotes', value: 'down' }))
         .addStringOption(opt => opt
             .setName('per')
             .setDescription('Average per message instead of a total (default: no)')
@@ -179,7 +198,16 @@ const commands = [
                 { name: 'Harshest voters', value: 'harshest' },
                 { name: 'Kindest voters', value: 'kindest' },
                 { name: 'Best messages by net score', value: 'bestmessages' },
-                { name: 'Worst messages by net score', value: 'worstmessages' })))
+                { name: 'Worst messages by net score', value: 'worstmessages' }))),
+    addFilterOptions(new SlashCommandBuilder()
+        .setName('channels')
+        .setDescription('Rank channels by votes, or see one channel in detail')
+        .setContexts(InteractionContextType.Guild)
+        .addStringOption(opt => opt
+            .setName('sort')
+            .setDescription('What to rank channels by (default: net score)')
+            .addChoices(...CHANNEL_SORT_CHOICES)),
+        undefined, 'Show this one channel in detail instead of ranking them all')
 ];
 const COMMAND_NAMES = commands.map(c => c.name);
 
@@ -865,7 +893,7 @@ module.exports = function setupLeaderboard(client, log) {
 
         // Who votes on this person's messages. Each heading has two facts: who does it the most, and who
         // does it far more than they usually vote, which tells a pattern from someone who votes on everything.
-        // A top pick with fewer than a handful of votes in total is shown after the first pick with enough.
+        // A top pick with fewer than a handful of votes in total is shown after the first pick with enough
         const topVoter = (isUp) => fans.filter(r => !!r.is_up === isUp).sort((a, b) => b.total - a.total)[0];
         function voterField(name, kind, most, ranked, totalOf, minTotal, label, describe) {
             const { top, qualified } = pickTop(ranked.filter(r => r.lift > 1), totalOf, minTotal);
@@ -981,7 +1009,7 @@ module.exports = function setupLeaderboard(client, log) {
         const window = await readWindow(interaction);
         if (!window) return;
         await interaction.deferReply();
-        const modeKey = interaction.options.getString('mode') ?? 'up';
+        const modeKey = interaction.options.getString('mode') ?? 'score';
         const mode = VOTE_MODES[modeKey];
         const per = interaction.options.getString('per');
         const cumulative = interaction.options.getBoolean('cumulative') ?? true;
@@ -1122,7 +1150,195 @@ module.exports = function setupLeaderboard(client, log) {
         await sendChart(interaction, png, title({ display: '📊' }, 'Emoji over time', []), notes, keys);
     }
 
-    const per1000 = (down, votes) => (down / votes * 1000).toFixed(1);
+    const per1000 = (down, votes) => votes ? (down / votes * 1000).toFixed(1) : '0.0';
+
+    // ---- channels ----
+
+    async function replyChannels(interaction) {
+        const vote = await requireVotes(interaction);
+        if (!vote) return;
+        await interaction.deferReply();
+        const sortKey = interaction.options.getString('sort') ?? 'score';
+        const f = readFilters(interaction);
+        // A trend compares two whole years, which a period filter would cut short
+        if (sortKey === 'trending' && f.since !== null) {
+            await interaction.editReply('Trending compares the last 12 months with the 12 before, so it cannot be combined with a period.');
+            return;
+        }
+        // Here the channel option picks one to show in detail instead of filtering, so every channel is still
+        // fetched to rank it against the rest. The first label is that channel's, which the title doesn't want
+        const focusId = f.channelId;
+        const labels = f.labels.slice(1);
+        const guildId = interaction.guildId;
+        const [stats, detail] = await Promise.all([
+            channelStatsInBackground(DB_PATH, guildId, vote, f.media, f.since),
+            focusId ? channelDetailInBackground(DB_PATH, guildId, vote, focusId, f.media, f.since) : null
+        ]);
+
+        const n = (x) => x.toLocaleString('en-US');
+        const sign = (x) => x > 0 ? `+${n(x)}` : n(x);
+        const pct = (x) => x > 0 && x < 0.001 ? '<0.1%' : `${(x * 100).toFixed(x < 0.1 ? 1 : 0)}%`;
+        const each = (x) => (x > 0 ? '+' : '') + x.toFixed(2);
+        const votesIn = (c) => c.up + c.down;
+        const mediaAverage = (c) => c.media_score / c.media_voted;
+        const textAverage = (c) => c.text_score / c.text_voted;
+
+        const monthsOf = new Map();
+        for (const r of stats.months) {
+            if (!monthsOf.has(r.channel_id)) monthsOf.set(r.channel_id, []);
+            monthsOf.get(r.channel_id).push(r);
+        }
+        const currentMonth = new Date().toISOString().slice(0, 7);
+        const channels = stats.channels.map(c => ({
+            ...c, score: c.up - c.down, ...trendOf(monthsOf.get(c.channel_id) ?? [], currentMonth)
+        }));
+
+        // How each ranking orders channels and describes one. ok limits who can be ranked, so a channel with a
+        // handful of messages doesn't top an average. votes: false for rankings that don't depend on votes
+        const SORTS = {
+            score: { title: 'Net score', value: c => c.score,
+                show: c => `${sign(c.score)} (${n(c.up)} up, ${n(c.down)} down)` },
+            upvotes: { title: 'Upvotes', value: c => c.up,
+                show: c => `${n(c.up)} upvotes (${sign(c.score)} score)` },
+            downvotes: { title: 'Downvotes', value: c => c.down,
+                show: c => `${n(c.down)} downvotes (${per1000(c.down, votesIn(c))} per 1,000 votes)` },
+            approval: { title: 'Approval', min: `At least ${MIN_CHANNEL_VOTES} votes`,
+                ok: c => votesIn(c) >= MIN_CHANNEL_VOTES, value: c => wilson(c.up, votesIn(c))[0],
+                show: c => `${per1000(c.down, votesIn(c))} down per 1,000 votes (${n(c.up)} up, ${n(c.down)} down)` },
+            average: { title: 'Score per message with a reaction', min: `At least ${MIN_CHANNEL_MESSAGES} messages`,
+                ok: c => c.messages >= MIN_CHANNEL_MESSAGES, value: c => c.score / c.messages,
+                show: c => `${(c.score / c.messages).toFixed(2)} per message (${n(c.messages)} messages)` },
+            controversy: { title: 'Most controversial', min: `At least ${MIN_CHANNEL_MESSAGES} messages with a vote`,
+                ok: c => c.voted >= MIN_CHANNEL_MESSAGES, value: c => c.both_votes / c.voted,
+                show: c => `${pct(c.both_votes / c.voted)} of voted messages got both (${n(c.both_votes)} of ${n(c.voted)})` },
+            messages: { title: 'Messages with a reaction', votes: false, value: c => c.messages,
+                show: c => `${n(c.messages)} messages (${n(c.authors)} people)` },
+            posters: { title: 'People posting', votes: false, value: c => c.authors,
+                show: c => `${n(c.authors)} people (${n(c.messages)} messages)` },
+            media: { title: 'Share with media', votes: false, min: `At least ${MIN_CHANNEL_MESSAGES} messages`,
+                ok: c => c.messages >= MIN_CHANNEL_MESSAGES, value: c => c.media / c.messages,
+                show: c => `${pct(c.media / c.messages)} have media (${n(c.media)} of ${n(c.messages)})` },
+            mediaedge: { title: 'Media vs text edge',
+                min: `At least ${MIN_MEDIA_GROUP} media and ${MIN_MEDIA_GROUP} text messages with a vote`,
+                ok: c => c.media_voted >= MIN_MEDIA_GROUP && c.text_voted >= MIN_MEDIA_GROUP,
+                value: c => mediaAverage(c) - textAverage(c),
+                show: c => `media ${each(mediaAverage(c))} vs text ${each(textAverage(c))} per message with a vote` },
+            trending: { title: 'Trending', min: `At least ${MIN_TREND_PRIOR} score in the 12 months before`,
+                ok: c => c.prior >= MIN_TREND_PRIOR, value: c => c.recent / c.prior,
+                show: c => `${(c.recent / c.prior).toFixed(1)}x: ${sign(c.recent)} in the last 12 months, ${sign(c.prior)} before` }
+        };
+        const ranked = (key) => {
+            const sort = SORTS[key];
+            return channels
+                .filter(c => (sort.votes === false || votesIn(c) > 0) && (sort.ok?.(c) ?? true))
+                .sort((a, b) => sort.value(b) - sort.value(a) || b.score - a.score);
+        };
+        // "#3 of 12", or null when the channel isn't eligible for that ranking
+        const rankOf = (key, c) => {
+            const list = ranked(key);
+            const at = list.findIndex(x => x.channel_id === c.channel_id);
+            return at === -1 ? null : `#${at + 1} of ${list.length}`;
+        };
+
+        const keys = [vote.up.key, vote.down.key];
+        const footerOf = (...parts) => [...parts, isScanning(guildId, keys) && 'Still counting older messages, totals may change.']
+            .filter(Boolean).join(' · ');
+
+        if (!focusId) {
+            const sort = SORTS[sortKey];
+            const rows = ranked(sortKey);
+            const embed = new EmbedBuilder()
+                .setTitle(title({ display: '📺' }, `Channels · ${sort.title}`, labels))
+                .setDescription((rows.length
+                    ? rows.slice(0, TOP_N).map((c, i) => `**${i + 1}.** <#${c.channel_id}> — ${sort.show(c)}`).join('\n')
+                    : 'No channels to rank yet.') + (sortKey === 'approval' ? `\n\n${WILSON_EXPLAINER}` : ''));
+            const footer = footerOf(sort.min, rows.length && `${rows.length} channels ranked`);
+            if (footer) embed.setFooter({ text: footer });
+            await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+            return;
+        }
+
+        // One channel in detail
+        const c = channels.find(x => x.channel_id === focusId);
+        if (!c) {
+            await interaction.editReply('Nothing is stored for that channel yet.');
+            return;
+        }
+        const tracked = getTracked(interaction.guild);
+        const serverScore = channels.reduce((sum, x) => sum + x.score, 0);
+        const link = (r) => `[Jump](https://discord.com/channels/${guildId}/${focusId}/${r.id}) · ${sign(r.net)} `
+            + `(${n(r.up)} up, ${n(r.down)} down) · <@${r.author_id}> · <t:${Math.floor(createdAt(r.id) / 1000)}:d>`;
+        const embed = new EmbedBuilder()
+            .setTitle(title({ display: '📺' }, 'Channel', labels))
+            .setDescription(`<#${focusId}>`);
+        const add = (name, lines) => {
+            const value = lines.filter(Boolean).join('\n');
+            if (value) embed.addFields({ name, value, inline: true });
+        };
+
+        add('Score', [
+            `**${sign(c.score)}** (${n(c.up)} up, ${n(c.down)} down)`,
+            rankOf('score', c) && `${rankOf('score', c)} channels by score`,
+            serverScore > 0 && c.score > 0 && `${pct(c.score / serverScore)} of the server's score`
+        ]);
+        if (votesIn(c) > 0) {
+            add('Approval', [
+                `${per1000(c.down, votesIn(c))} downvotes per 1,000 votes`,
+                rankOf('approval', c) && `${rankOf('approval', c)} channels`
+            ]);
+        }
+        add('Messages with a reaction', [
+            `**${n(c.messages)}** from ${n(c.authors)} people`,
+            c.messages > 0 && `${pct(c.voted / c.messages)} got a vote, ${pct(c.media / c.messages)} have media`
+        ]);
+        if (c.messages > 0) {
+            add('Average score', [
+                `${(c.score / c.messages).toFixed(2)} per message with a reaction`,
+                c.voted > 0 && `${(c.score / c.voted).toFixed(2)} per message with a vote`,
+                rankOf('average', c) && `${rankOf('average', c)} channels`
+            ]);
+        }
+        if (c.media_voted > 0 && c.text_voted > 0) {
+            add('Media vs text', [
+                `Media ${each(mediaAverage(c))} per message with a vote (${n(c.media_voted)} messages)`,
+                `Text ${each(textAverage(c))} per message with a vote (${n(c.text_voted)} messages)`
+            ]);
+        }
+        if (c.voted > 0) {
+            add('Controversial', [
+                `${pct(c.both_votes / c.voted)} of voted messages got both an upvote and a downvote (${n(c.both_votes)})`,
+                rankOf('controversy', c) && `${rankOf('controversy', c)} channels`
+            ]);
+        }
+
+        const topPoster = detail.authors.map(r => ({ ...r, net: r.up - r.down })).sort((a, b) => b.net - a.net)[0];
+        const upvoters = detail.voters.filter(r => r.up_given > 0).sort((a, b) => b.up_given - a.up_given);
+        add('People', [
+            `${n(upvoters.length)} people gave upvotes here`,
+            topPoster && `Top poster: <@${topPoster.author_id}> · ${sign(topPoster.net)}`
+                + (c.score > 0 && topPoster.net > 0 ? ` (${pct(topPoster.net / c.score)} of the channel's score)` : ''),
+            upvoters[0] && `Biggest upvoter: <@${upvoters[0].user_id}> · ${n(upvoters[0].up_given)}`
+        ]);
+
+        const peak = peakMonth(monthsOf.get(focusId) ?? []);
+        // The two-year comparison is only fair on all-time numbers, but the best month stands on its own
+        const compared = f.since === null;
+        add('Trend', [
+            compared && (c.recent !== 0 || c.prior !== 0) && `${sign(c.recent)} in the last 12 months, ${sign(c.prior)} in the 12 before`,
+            compared && c.prior >= MIN_TREND_PRIOR && `${(c.recent / c.prior).toFixed(1)}x last year's pace`,
+            peak && `Best month: ${peak.month} (${sign(peak.score)})`
+        ]);
+
+        add('Best message', [detail.best && link(detail.best)]);
+        add('Worst message', [detail.worst && link(detail.worst)]);
+        const displayOf = new Map(tracked.map(e => [e.key, e.display]));
+        const others = detail.emojis.filter(e => !keys.includes(e.match_key)).slice(0, 6);
+        add('Most used emojis', [others.map(e => `${displayOf.get(e.match_key) ?? e.match_key} ${n(e.total)}`).join(' · ')]);
+
+        const footer = footerOf('Only messages with a reaction are stored');
+        embed.setFooter({ text: footer });
+        await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
+    }
 
     async function replyVotes(interaction) {
         const vote = await requireVotes(interaction);
@@ -1137,9 +1353,7 @@ module.exports = function setupLeaderboard(client, log) {
         let lines;
         let footer = null;
         // Approval and both voter rankings are ordered by the Wilson bound
-        const explainer = ['approval', 'harshest', 'kindest'].includes(view)
-            ? 'Explaining the Wilson bound (i.e. why things are ordered like this): http://alecbenzer.com/blog/how-to-sort-ratings/'
-            : null;
+        const explainer = ['approval', 'harshest', 'kindest'].includes(view) ? WILSON_EXPLAINER : null;
 
         if (view === 'bestmessages' || view === 'worstmessages') {
             const rows = await votesByMessageInBackground(DB_PATH, view === 'worstmessages', interaction.guildId,
@@ -1288,7 +1502,7 @@ module.exports = function setupLeaderboard(client, log) {
                 return;
             }
             // These have no emoji option, so they are handled before the emoji lookup below
-            const voteCommand = { votegraph: replyVoteGraph, emojigraph: replyEmojiGraph, votes: replyVotes }[interaction.commandName];
+            const voteCommand = { votegraph: replyVoteGraph, emojigraph: replyEmojiGraph, votes: replyVotes, channels: replyChannels }[interaction.commandName];
             if (voteCommand) {
                 await voteCommand(interaction);
                 return;

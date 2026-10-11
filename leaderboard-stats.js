@@ -81,6 +81,36 @@ function tally(onYou) {
     return votes;
 }
 
+// The month n months before (or after, if negative) a YYYY-MM
+function shiftMonth(month, n) {
+    const [year, mon] = month.split('-').map(Number);
+    const index = year * 12 + (mon - 1) - n;
+    return `${Math.floor(index / 12)}-${String(index % 12 + 1).padStart(2, '0')}`;
+}
+
+// Score over the last 12 months up to and including currentMonth, and over the 12 before that. Rows are
+// { month, up, down } for one channel
+function trendOf(rows, currentMonth) {
+    const recentFrom = shiftMonth(currentMonth, 11);
+    const priorFrom = shiftMonth(currentMonth, 23);
+    let recent = 0;
+    let prior = 0;
+    for (const r of rows) {
+        if (r.month >= recentFrom && r.month <= currentMonth) recent += r.up - r.down;
+        else if (r.month >= priorFrom && r.month < recentFrom) prior += r.up - r.down;
+    }
+    return { recent, prior };
+}
+
+// The month with the best net score, or null with no rows
+function peakMonth(rows) {
+    let best = null;
+    for (const r of rows) {
+        if (!best || r.up - r.down > best.score) best = { month: r.month, score: r.up - r.down };
+    }
+    return best;
+}
+
 // Voters ranked by how much more they downvote one person than they do everyone else.
 // onYou: rows of { user_id, is_up, total } for the person. habits: Map of user ID -> { up_given, down_given }
 // over everything they voted on. Voters are compared with their own rate elsewhere, so someone who
@@ -144,5 +174,5 @@ function pickTop(ranked, totalOf, minTotal) {
 
 module.exports = {
     wilson, monthRange, alignToMonths, runningTotal, spanOf, rankHaters, rankFans, pickTop, parseMonth, trimMonths,
-    ratioSeries, MIN_HATER_TOTAL_DOWNVOTES, MIN_FAN_TOTAL_UPVOTES
+    ratioSeries, shiftMonth, trendOf, peakMonth, MIN_HATER_TOTAL_DOWNVOTES, MIN_FAN_TOTAL_UPVOTES
 };
