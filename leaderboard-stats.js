@@ -4,6 +4,9 @@ const WILSON_Z = 1.96;           // 95% confidence
 const MIN_BASELINE_SHARE = 0.001; // a baseline of zero would make any downvote look infinitely hateful
 const MIN_BASELINE_VOTES = 20;   // votes elsewhere needed before a voter's usual rate means anything
 const MIN_HATER_DOWNVOTES = 3;   // downvotes on someone before it can be called a pattern
+const MIN_FAN_UPVOTES = 5;       // upvotes on someone before it can be called a pattern
+const MIN_HATER_TOTAL_DOWNVOTES = 25; // downvotes someone gave in total before they are the headline hater
+const MIN_FAN_TOTAL_UPVOTES = 10;     // upvotes someone gave in total before they are the headline fan
 
 // [low, high] bound on the true share behind k out of n. Small samples give wide bounds, so ranking by
 // the low end keeps 5 upvotes and 0 downvotes from beating 5000 upvotes and 30 downvotes
@@ -67,17 +70,23 @@ function ratioSeries(numerators, denominators, cumulative) {
     return top.map((n, i) => bottom[i] === 0 ? null : n / bottom[i]);
 }
 
-// Voters ranked by how much more they downvote one person than they do everyone else.
-// onYou: rows of { user_id, is_up, total } for the person. habits: Map of user ID -> { up_given, down_given }
-// over everything they voted on. Voters are compared with their own rate elsewhere, so someone who
-// downvotes everybody a lot doesn't top the list for being harsh
-function rankHaters(onYou, habits) {
+// Votes on one person by voter, as a Map of user ID -> { up, down }
+function tally(onYou) {
     const votes = new Map();
     for (const r of onYou) {
         const entry = votes.get(r.user_id) ?? { up: 0, down: 0 };
         entry[r.is_up ? 'up' : 'down'] += r.total;
         votes.set(r.user_id, entry);
     }
+    return votes;
+}
+
+// Voters ranked by how much more they downvote one person than they do everyone else.
+// onYou: rows of { user_id, is_up, total } for the person. habits: Map of user ID -> { up_given, down_given }
+// over everything they voted on. Voters are compared with their own rate elsewhere, so someone who
+// downvotes everybody a lot doesn't top the list for being harsh
+function rankHaters(onYou, habits) {
+    const votes = tally(onYou);
     const ranked = [];
     for (const [userId, { up, down }] of votes) {
         const habit = habits.get(userId);
@@ -90,6 +99,7 @@ function rankHaters(onYou, habits) {
         ranked.push({
             userId,
             down,
+            totalDown: habit.down_given,
             votes: onYouVotes,
             lift: down / onYouVotes / baseline,
             score: wilson(down, onYouVotes)[0] / baseline
@@ -98,6 +108,41 @@ function rankHaters(onYou, habits) {
     return ranked.sort((a, b) => b.score - a.score);
 }
 
+// Voters ranked by how much of their upvoting goes to one person, against the share of everyone's upvoting
+// that person gets. Upvotes are about 97% of all votes for nearly everyone, so comparing upvote share on
+// the person against elsewhere (the way rankHaters does for downvotes) barely moves and ranks nothing.
+// Same inputs as rankHaters
+function rankFans(onYou, habits) {
+    const votes = tally(onYou);
+    let everyoneUp = 0;
+    let personUp = 0;
+    for (const habit of habits.values()) everyoneUp += habit.up_given;
+    for (const { up } of votes.values()) personUp += up;
+    if (everyoneUp === 0 || personUp === 0) return [];
+    const baseline = personUp / everyoneUp;
+    const ranked = [];
+    for (const [userId, { up }] of votes) {
+        const habit = habits.get(userId);
+        if (!habit || habit.up_given === 0 || up < MIN_FAN_UPVOTES) continue;
+        ranked.push({
+            userId,
+            up,
+            totalUp: habit.up_given,
+            share: up / habit.up_given,
+            lift: up / habit.up_given / baseline,
+            score: wilson(up, habit.up_given)[0] / baseline
+        });
+    }
+    return ranked.sort((a, b) => b.score - a.score);
+}
+
+// The top of a ranking, and the first with at least minTotal votes overall to be a headline. They are the
+// same person unless the top pick has only a few votes overall, which is worth saying next to the real one
+function pickTop(ranked, totalOf, minTotal) {
+    return { top: ranked[0] ?? null, qualified: ranked.find(r => totalOf(r) >= minTotal) ?? null };
+}
+
 module.exports = {
-    wilson, monthRange, alignToMonths, runningTotal, spanOf, rankHaters, parseMonth, trimMonths, ratioSeries
+    wilson, monthRange, alignToMonths, runningTotal, spanOf, rankHaters, rankFans, pickTop, parseMonth, trimMonths,
+    ratioSeries, MIN_HATER_TOTAL_DOWNVOTES, MIN_FAN_TOTAL_UPVOTES
 };

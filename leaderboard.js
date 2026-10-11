@@ -22,7 +22,8 @@ const {
 } = require('./leaderboard-db');
 const { renderLineChart, emojiIconUrl } = require('./leaderboard-chart');
 const {
-    wilson, spanOf, alignToMonths, runningTotal, rankHaters, parseMonth, trimMonths, ratioSeries
+    wilson, spanOf, alignToMonths, runningTotal, rankHaters, rankFans, pickTop, parseMonth, trimMonths, ratioSeries,
+    MIN_HATER_TOTAL_DOWNVOTES, MIN_FAN_TOTAL_UPVOTES
 } = require('./leaderboard-stats');
 
 const CONFIG_PATH = path.join(__dirname, 'leaderboard-config.json');
@@ -35,6 +36,7 @@ const SCAN_CONCURRENCY = 5;
 const READ_PERMS = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory];
 const SCANNED_CHANNEL_TYPES = [ChannelType.GuildText, ChannelType.GuildAnnouncement];
 
+const AVERAGE_COLOUR = '#80848e'; // the average user's dashed line, grey so it never reads as a person
 const MIN_VOTES = 20;          // votes someone needs before /votes ranks their approval or habits
 const EMOJI_GRAPH_MAX = 10;    // lines on /emojigraph, as many as the chart palette has colours for
 const HABITS_REFRESH_MS = 10 * 60_000;
@@ -131,18 +133,30 @@ const commands = [
             .setDescription('Running total instead of per month (default: yes)'))
         .addUserOption(opt => opt
             .setName('user')
-            .setDescription("Only count this person's messages")), CHART_PERIODS)),
+            .setDescription("Only count this person's messages"))
+        .addUserOption(opt => opt
+            .setName('user2')
+            .setDescription('Chart a second person on the same plot to compare'))
+        .addBooleanOption(opt => opt
+            .setName('average')
+            .setDescription('With a person chosen, draw the average user as a dashed line (default: yes)')), CHART_PERIODS)),
     addWindowOptions(addFilterOptions(new SlashCommandBuilder()
         .setName('emojigraph')
         .setDescription('Chart how often the most used emojis are used over time')
         .setContexts(InteractionContextType.Guild)
         .addUserOption(opt => opt
             .setName('user')
-            .setDescription('Chart this person instead of the whole server'))
+            .setDescription('Chart this person (default: you)'))
+        .addBooleanOption(opt => opt
+            .setName('server')
+            .setDescription('Chart the whole server instead of a person'))
         .addStringOption(opt => opt
             .setName('type')
-            .setDescription("With a user: emojis they gave (default) or received")
+            .setDescription('For a person: emojis they gave (default) or received')
             .addChoices({ name: 'Given', value: 'given' }, { name: 'Received', value: 'received' }))
+        .addStringOption(opt => opt
+            .setName('exclude')
+            .setDescription('Emojis to leave out, separated by spaces (names or the emojis themselves)'))
         .addIntegerOption(opt => opt
             .setName('count')
             .setDescription(`How many emojis to chart (default: ${EMOJI_GRAPH_MAX})`)
@@ -849,22 +863,25 @@ module.exports = function setupLeaderboard(client, log) {
             embed.addFields({ name: 'Top channel', value: `<#${topChannel[0]}> · ${n(topChannel[1])} received` });
         }
 
-        // Who votes on this person's messages
+        // Who votes on this person's messages. Each heading has two facts: who does it the most, and who
+        // does it far more than they usually vote, which tells a pattern from someone who votes on everything.
+        // A top pick with fewer than a handful of votes in total is shown after the first pick with enough.
         const topVoter = (isUp) => fans.filter(r => !!r.is_up === isUp).sort((a, b) => b.total - a.total)[0];
-        const fan = topVoter(true);
-        const downvoter = topVoter(false);
-        const hater = rankHaters(fans, habits)[0];
-        if (fan) embed.addFields({ name: 'Biggest fan', value: `<@${fan.user_id}> · ${n(fan.total)} upvotes`, inline: true });
-        if (downvoter) {
-            embed.addFields({ name: 'Most downvotes from', value: `<@${downvoter.user_id}> · ${n(downvoter.total)}`, inline: true });
+        function voterField(name, kind, most, ranked, totalOf, minTotal, label, describe) {
+            const { top, qualified } = pickTop(ranked.filter(r => r.lift > 1), totalOf, minTotal);
+            const lines = [];
+            if (most) lines.push(`Most ${kind}s: <@${most.user_id}> · ${n(most.total)}`);
+            if (qualified) lines.push(`${label}: <@${qualified.userId}> · ${describe(qualified)}`);
+            if (top && top !== qualified) {
+                lines.push(`${qualified ? 'Also' : label}: <@${top.userId}> · ${describe(top)} `
+                    + `(only ${n(totalOf(top))} ${kind}s in total)`);
+            }
+            if (lines.length) embed.addFields({ name, value: lines.join('\n'), inline: true });
         }
-        if (hater && hater.lift > 1) {
-            embed.addFields({
-                name: 'Biggest hater',
-                value: `<@${hater.userId}> · ${n(hater.down)} downvotes, ${hater.lift.toFixed(1)}x their usual rate`,
-                inline: true
-            });
-        }
+        voterField('Biggest fan', 'upvote', topVoter(true), rankFans(fans, habits), r => r.totalUp, MIN_FAN_TOTAL_UPVOTES, 'Most devoted',
+            r => `${n(r.up)} upvotes, ${(r.share * 100).toFixed(0)}% of all they give (${r.lift.toFixed(1)}x the usual)`);
+        voterField('Biggest hater', 'downvote', topVoter(false), rankHaters(fans, habits), r => r.totalDown, MIN_HATER_TOTAL_DOWNVOTES, 'Targets you most',
+            r => `${n(r.down)} downvotes, ${r.lift.toFixed(1)}x their usual rate`);
 
         if (scanningGuilds.has(interaction.guildId) || db.hasPendingAny(interaction.guildId, keys)) {
             embed.setFooter({ text: 'Still counting older messages, totals may change.' });
@@ -892,8 +909,12 @@ module.exports = function setupLeaderboard(client, log) {
         return promise;
     }
 
-    const nameOf = (interaction, user) =>
-        interaction.options.getMember('user')?.displayName ?? user.globalName ?? user.username;
+    // option is which user option the person came from, since /votegraph has two. Someone who is not
+    // from an option is the caller
+    const nameOf = (interaction, user, option = 'user') =>
+        interaction.options.getMember(option)?.displayName
+        ?? (user.id === interaction.user.id ? interaction.member?.displayName : null)
+        ?? user.globalName ?? user.username;
 
     // The vote emojis from the config. Replies and returns null when they are not set up, so callers return
     async function requireVotes(interaction) {
@@ -964,44 +985,87 @@ module.exports = function setupLeaderboard(client, log) {
         const mode = VOTE_MODES[modeKey];
         const per = interaction.options.getString('per');
         const cumulative = interaction.options.getBoolean('cumulative') ?? true;
-        const user = interaction.options.getUser('user');
+        // One or two people, the same person twice counted once
+        const users = [['user', interaction.options.getUser('user')], ['user2', interaction.options.getUser('user2')]]
+            .filter(([, person], i, all) => person && all.findIndex(([, other]) => other?.id === person.id) === i);
+        const showAverage = users.length > 0 && (interaction.options.getBoolean('average') ?? true);
         const f = readFilters(interaction);
         // Cutting the window here, before anything is added up, makes a running total start at zero in it
-        const rows = trimMonths(await votesByMonthInBackground(DB_PATH, interaction.guildId, vote, user?.id ?? null,
-            f.channelId, f.media, f.since), window.from, window.to);
-        const months = spanOf(rows);
+        const fetchRows = async (authorId) => trimMonths(await votesByMonthInBackground(DB_PATH, interaction.guildId, vote,
+            authorId, f.channelId, f.media, f.since), window.from, window.to);
+        // Everyone's rows are the chart itself when no person is chosen, otherwise only the average line's source
+        const [everyone, ...personal] = await Promise.all([
+            users.length === 0 || showAverage ? fetchRows(null) : [],
+            ...users.map(([, person]) => fetchRows(person.id))
+        ]);
+        const shown = users.length ? personal : [everyone];
+        // The axis follows the people charted, so the server's longer history doesn't stretch it
+        const months = spanOf(...shown);
         if (!months) {
             await interaction.editReply('No votes found.');
             return;
         }
-        const totals = alignToMonths(rows, months, mode.pick);
         // Months can exist only because of the other vote type, which would chart a flat line of zeros
-        if (totals.every(v => v === 0)) {
+        if (shown.every(rows => alignToMonths(rows, months, mode.pick).every(v => v === 0))) {
             await interaction.editReply(`No ${mode.label.toLowerCase()} found.`);
             return;
         }
-        const divisors = per && alignToMonths(rows, months, r => per === 'voted' ? r.voted : r.messages);
-        const values = per ? ratioSeries(totals, divisors, cumulative) : cumulative ? runningTotal(totals) : totals;
+        const divisorOf = (r) => per === 'voted' ? r.voted : r.messages;
         const icon = modeKey === 'score' ? null : emojiIconUrl(vote[modeKey].display);
+        const series = shown.map((rows, i) => {
+            const totals = alignToMonths(rows, months, mode.pick);
+            return {
+                label: users.length ? nameOf(interaction, users[i][1], users[i][0]) : mode.label,
+                values: per ? ratioSeries(totals, alignToMonths(rows, months, divisorOf), cumulative)
+                    : cumulative ? runningTotal(totals) : totals,
+                iconUrl: icon
+            };
+        });
+        if (showAverage) {
+            // The average user: everyone's votes in a month shared between the people who posted that month. For
+            // an average per message the server's own ratio already is the average, so it is used as it stands
+            const everyoneTotals = alignToMonths(everyone, months, mode.pick);
+            const perUser = alignToMonths(everyone, months, r => r.authors ? mode.pick(r) / r.authors : 0);
+            const average = per ? ratioSeries(everyoneTotals, alignToMonths(everyone, months, divisorOf), cumulative)
+                : cumulative ? runningTotal(perUser) : perUser;
+            // An average per message swings wildly in the first months, when only a few messages exist. Starting it
+            // where the charted people do keeps those swings from stretching the axis over the real lines
+            const start = Math.min(...series.map(line => line.values.findIndex(v => v !== null)).filter(i => i >= 0));
+            series.push({
+                label: per ? 'Everyone' : 'Average user',
+                values: average.map((v, i) => i < start ? null : v),
+                colour: AVERAGE_COLOUR,
+                dashed: true
+            });
+        }
         const shape = per ? (cumulative ? 'running average' : 'per month') : (cumulative ? 'running total' : 'per month');
         const png = await renderLineChart({
-            title: [per ? `${mode.label} per ${PER_LABELS[per]}` : mode.label, shape, user && nameOf(interaction, user),
+            title: [per ? `${mode.label} per ${PER_LABELS[per]}` : mode.label, shape,
+                users.map(([option, person]) => nameOf(interaction, person, option)).join(' vs '),
                 window.label, ...f.labels].filter(Boolean).join(' - '),
             labels: months,
-            series: [{ label: mode.label, values, iconUrl: icon }]
+            series
         });
         // Messages with no reaction aren't stored, so that average is over fewer messages than were sent
         await sendChart(interaction, png, title({ display: '📈' }, 'Votes over time', []),
-            per === 'messages' && 'Only messages with a reaction are stored, not every message sent',
+            [per === 'messages' && 'Only messages with a reaction are stored, not every message sent',
+                showAverage && (per ? 'Dashed line: everyone combined'
+                    : 'Dashed line: average of the people who posted that month')].filter(Boolean).join(' · '),
             [vote.up.key, vote.down.key]);
     }
 
     async function replyEmojiGraph(interaction) {
         const window = await readWindow(interaction);
         if (!window) return;
+        const server = interaction.options.getBoolean('server') ?? false;
+        if (server && interaction.options.getUser('user')) {
+            await interaction.reply({ content: 'Pick a person or the whole server, not both.', flags: MessageFlags.Ephemeral });
+            return;
+        }
         await interaction.deferReply();
-        const user = interaction.options.getUser('user');
-        // Without a user it is the server's totals, where given and received are the same reactions
+        // The caller unless told otherwise, since their own emojis are what people look for first
+        const user = server ? null : interaction.options.getUser('user') ?? interaction.user;
+        // For the server it is everyone's totals, where given and received are the same reactions
         const given = user ? (interaction.options.getString('type') ?? 'given') === 'given' : false;
         const count = interaction.options.getInteger('count') ?? EMOJI_GRAPH_MAX;
         const cumulative = interaction.options.getBoolean('cumulative') ?? false;
@@ -1009,11 +1073,21 @@ module.exports = function setupLeaderboard(client, log) {
         const tracked = getTracked(interaction.guild);
         const byKey = new Map(tracked.map(e => [e.key, e]));
 
+        // Left out before the top emojis are picked, so the chart fills up with the next ones instead
+        const excluded = new Set();
+        const unknown = [];
+        for (const token of (interaction.options.getString('exclude') ?? '').split(/[\s,]+/).filter(Boolean)) {
+            const emoji = resolveEmoji(token, tracked);
+            if (emoji) excluded.add(emoji.key);
+            else unknown.push(token);
+        }
+
         // Server: the most used emojis by the totals the autocomplete already keeps. A person: their own
         // most used, so every emoji is fetched and the busiest are picked from the totals
         const used = emojiUsage(interaction.guildId);
-        const candidates = user ? [...byKey.keys()]
-            : [...byKey.keys()].sort((a, b) => (used.get(b) ?? 0) - (used.get(a) ?? 0)).slice(0, count);
+        const allowed = [...byKey.keys()].filter(key => !excluded.has(key));
+        const candidates = user ? allowed
+            : allowed.sort((a, b) => (used.get(b) ?? 0) - (used.get(a) ?? 0)).slice(0, count);
         const rows = trimMonths(await emojiByMonthInBackground(DB_PATH, interaction.guildId, candidates, given,
             user?.id ?? null, f.channelId, f.media, f.since, loadConfig().voteEmojis), window.from, window.to);
 
@@ -1035,13 +1109,17 @@ module.exports = function setupLeaderboard(client, log) {
             };
         });
         const who = user ? `${nameOf(interaction, user)} (${given ? 'given' : 'received'})` : 'Server';
+        const notes = [
+            excluded.size && `Left out: ${[...excluded].map(key => byKey.get(key).name).join(', ')}`,
+            unknown.length && `Not found: ${unknown.join(', ')}`
+        ].filter(Boolean).join(' · ');
         const png = await renderLineChart({
             title: ['Emoji use', cumulative ? 'running total' : 'per month', who, window.label, ...f.labels]
                 .filter(Boolean).join(' - '),
             labels: months,
             series
         });
-        await sendChart(interaction, png, title({ display: '📊' }, 'Emoji over time', []), null, keys);
+        await sendChart(interaction, png, title({ display: '📊' }, 'Emoji over time', []), notes, keys);
     }
 
     const per1000 = (down, votes) => (down / votes * 1000).toFixed(1);

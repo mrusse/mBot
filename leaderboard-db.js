@@ -448,18 +448,19 @@ const UP_SUM = `SUM(CASE WHEN is_up THEN total ELSE 0 END)`;
 const DOWN_SUM = `SUM(CASE WHEN is_up THEN 0 ELSE total END)`;
 
 // voted: messages that got at least one counted upvote or downvote, the divisor for score per voted
-// message. A message with both has a row for each, hence the DISTINCT.
+// message. A message with both has a row for each, hence the DISTINCT
 const VOTES_BY_MONTH = `
     SELECT month, ${UP_SUM} AS up, ${DOWN_SUM} AS down,
            COUNT(DISTINCT CASE WHEN total > 0 THEN id END) AS voted
     FROM (${VOTES_PER_MESSAGE}) GROUP BY month ORDER BY month
 `;
 
-// Stored messages per month. Only messages with at least one reaction are stored, so this is not how many
-// messages were sent, and it is the divisor for score per message with a reaction.
+// Stored messages per month, and how many different people posted them. Only messages with at least one
+// reaction are stored, so this is not how many messages were sent, and it is the divisor for score per
+// message with a reaction.
 // Params: guildId, authorId (twice, null for everyone), then the filters
 const MESSAGES_BY_MONTH = `
-    SELECT ${POSTED_MONTH} AS month, COUNT(*) AS messages
+    SELECT ${POSTED_MONTH} AS month, COUNT(*) AS messages, COUNT(DISTINCT m.author_id) AS authors
     FROM messages m
     WHERE m.guild_id = ? AND (? IS NULL OR m.author_id = ?) ${FILTERS}
     GROUP BY month
@@ -600,10 +601,10 @@ async function votesByMonthInBackground(file, guildId, vote, authorId, channelId
         { sql: VOTES_BY_MONTH, params: votesParams(vote, guildId, authorId, filters) },
         { sql: MESSAGES_BY_MONTH, params: [guildId, authorId, authorId, ...filters] }
     ]);
-    const byMonth = new Map(votes.map(r => [r.month, { ...r, messages: 0 }]));
-    for (const { month, messages: count } of messages) {
+    const byMonth = new Map(votes.map(r => [r.month, { ...r, messages: 0, authors: 0 }]));
+    for (const { month, messages: count, authors } of messages) {
         const row = byMonth.get(month) ?? { month, up: 0, down: 0, voted: 0 };
-        byMonth.set(month, { ...row, messages: count });
+        byMonth.set(month, { ...row, messages: count, authors });
     }
     return [...byMonth.values()].sort((a, b) => a.month < b.month ? -1 : 1);
 }

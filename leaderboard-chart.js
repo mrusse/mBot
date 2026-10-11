@@ -64,13 +64,16 @@ function emojiIconUrl(display) {
     return id ? `https://cdn.discordapp.com/emojis/${id}.png?size=48` : null;
 }
 
-// series: [{ label, values, iconUrl? }], values lining up with labels. Returns a PNG buffer
+// series: [{ label, values, iconUrl?, colour?, dashed? }], values lining up with labels, null for a gap.
+// A dashed series is a reference line (for example the average user), so it is drawn thinner.
+// Returns a PNG buffer
 async function renderLineChart({ title, labels, series }) {
     const icons = await Promise.all(series.map(s => loadIcon(s.iconUrl)));
     const canvas = createCanvas(WIDTH, HEIGHT);
     // Chart.js reads canvas.style, which node-canvas doesn't have
     canvas.style = {};
     const defaultLabels = Chart.defaults.plugins.legend.labels.generateLabels;
+    const colourOf = (i) => series[i].colour ?? PALETTE[i % PALETTE.length];
 
     const chart = new Chart(canvas, {
         type: 'line',
@@ -80,9 +83,10 @@ async function renderLineChart({ title, labels, series }) {
             datasets: series.map((s, i) => ({
                 label: s.label,
                 data: s.values,
-                borderColor: PALETTE[i % PALETTE.length],
-                backgroundColor: PALETTE[i % PALETTE.length],
-                borderWidth: 2.5,
+                borderColor: colourOf(i),
+                backgroundColor: colourOf(i),
+                borderWidth: s.dashed ? 2 : 2.5,
+                borderDash: s.dashed ? [8, 5] : [],
                 pointRadius: 0,
                 tension: 0
             }))
@@ -105,7 +109,7 @@ async function renderLineChart({ title, labels, series }) {
                         generateLabels(chart) {
                             return defaultLabels(chart).map(item => {
                                 const icon = icons[item.datasetIndex];
-                                const labelled = { ...item, fontColor: PALETTE[item.datasetIndex % PALETTE.length] };
+                                const labelled = { ...item, fontColor: colourOf(item.datasetIndex) };
                                 return icon ? { ...labelled, pointStyle: icon } : labelled;
                             });
                         }

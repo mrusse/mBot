@@ -117,7 +117,12 @@ Custom emojis are matched by name (ignoring capitalisation), so every upload of 
 
 `/topmessages <emoji> [user] [channel] [content] [period]` shows the messages with the most of that reaction, each with a link to jump to it, its author, channel and date. It shows 10 per page, up to 5 pages (top 50). Anyone can use the Previous/Next buttons for about 14 minutes, after which the reply goes back to page 1 and the buttons are removed. Pick a `user` to see only their messages (e.g. your own most-reacted posts); the other filters work the same as above.
 
-`/profile [user] [channel] [content] [period]` shows someone's reaction stats (default: you): reactions received and given with their top emojis, how many they give for each one received, their most reacted message, and the channel they get the most reactions in. With `voteEmojis` set it also shows their biggest fan (most upvotes on their messages), who has downvoted them the most, and their biggest hater: the person who downvotes them the most compared to how often that person downvotes everyone else. So someone who downvotes everybody a lot doesn't win just for being harsh.
+`/profile [user] [channel] [content] [period]` shows someone's reaction stats (default: you): reactions received and given with their top emojis, how many they give for each one received, their most reacted message, and the channel they get the most reactions in. With `voteEmojis` set it also shows two headings, each with two facts:
+
+- **Biggest fan**: who has upvoted them the most, and who is the most devoted, meaning the person who gives them the biggest share of their own upvotes compared to the share everyone's upvotes give them
+- **Biggest hater**: who has downvoted them the most, and who targets them most, meaning the person who downvotes them at the highest multiple of their usual downvoting rate
+
+Comparing people with their own habits means someone who downvotes everybody a lot doesn't win just for being harsh. A top pick who has given fewer than 25 downvotes in total (10 upvotes for fans) is listed after the first pick with enough, marked with how few they gave.
 
 Reactions from bots, reactions on bot messages, and reacting to your own message are not counted. Each person counts once per message, even if they react with several different uploads of the same emoji (e.g. five different upvotes). Deleted messages drop off the leaderboard.
 
@@ -125,16 +130,18 @@ Reactions from bots, reactions on bot messages, and reacting to your own message
 
 These need `voteEmojis` in the config. Anyone can use them, and they take the same `channel` and `content` filters as above.
 
-`/votegraph [mode] [per] [cumulative] [user] [from] [to] [channel] [content] [period]` draws a line chart of votes over time.
+`/votegraph [mode] [per] [cumulative] [user] [user2] [average] [from] [to] [channel] [content] [period]` draws a line chart of votes over time.
 
 - `mode`: **Upvotes** (default), **Downvotes** or **Score** (upvotes minus downvotes)
 - `per`: show an average instead of a total, either **per message with a reaction** or **per message with an upvote or downvote**. With `cumulative` on it is the average so far, otherwise each month's own average. A month with no messages to divide by is left as a gap
 - `cumulative`: a running total (default) or the amount per month
 - `user`: only count that person's messages
+- `user2`: a second person, drawn on the same plot to compare
+- `average`: with a person chosen, also draw a dashed line for the average user (default: yes). That is everyone's votes in a month shared between the people who posted that month, or with `per` set, the server's combined average. It starts where the chosen person's line does
 - `from` and `to`: only chart the months between them, written as `2024` or `2024-03` (a bare year means its first month for `from` and its last for `to`). A running total starts from zero at the first month shown
 - `period`: only **Past year** or all time, since shorter periods would leave a line with one or two points
 
-`/emojigraph [user] [type] [count] [cumulative] [from] [to] [channel] [content] [period]` draws the most used emojis over time, with the emoji images in the legend. For the whole server it picks the most used emojis. With a `user` it picks that person's own most used, and `type` chooses emojis they **Gave** (default) or **Received**. `count` is how many lines to draw (1 to 10, default 10), and `cumulative` defaults to off here.
+`/emojigraph [user] [server] [type] [exclude] [count] [cumulative] [from] [to] [channel] [content] [period]` draws the most used emojis over time, with the emoji images in the legend. It charts you by default: pick a `user` to chart someone else, or turn on `server` for the whole server's most used emojis. For a person, `type` chooses emojis they **Gave** (default) or **Received**. `exclude` is a list of emojis to leave out, separated by spaces, as names or the emojis themselves (`upvote kekw 🔥`), and the chart fills up with the next most used instead. Names it can't find are listed under the chart. `count` is how many lines to draw (1 to 10, default 10), and `cumulative` defaults to off here.
 
 `/votes <view> [channel] [content] [period]` ranks people or messages. `view` is one of:
 
