@@ -3,7 +3,7 @@
 A Discord bot for fun music stuff (and a bit more) in your server:
 
 - **Shared playlist**: when someone runs `.np` or `.fm`, mBot grabs the song [.fmbot](https://fmbot.xyz/) reports and adds it to a Spotify playlist.
-- **Reaction leaderboards**: `/leaderboard` ranks who has received or given the most of any emoji you choose to track.
+- **Reaction leaderboards**: `/leaderboard` ranks who has received or given the most of any emoji you choose to track, and `/emoji` breaks down how one emoji is used.
 - **Vote stats**: `/votegraph`, `/emojigraph` and `/votes` chart and rank upvotes, downvotes and emoji use over time.
 
 ## Discord Bot Setup
@@ -124,6 +124,20 @@ Custom emojis are matched by name (ignoring capitalisation), so every upload of 
 
 Comparing people with their own habits means someone who downvotes everybody a lot doesn't win just for being harsh. A top pick who has given fewer than 25 downvotes in total (10 upvotes for fans) is listed after the first pick with enough, marked with how few they gave.
 
+`/emoji <emoji> [cumulative] [channel] [content] [period]` analyses one emoji as a reaction. It doesn't need `voteEmojis`, and `/emoji upvote` uses the exact vote emoji when that is set. The reply is one embed with a line chart of the emoji per month (a running total with `cumulative`, left out when the span is under two months) and these facts:
+
+- **Totals**: reactions, messages, how many people gave it and how many received it, and the share of all messages with a reaction that carry it
+- **Biggest messages**: the top 3 with a link to each
+- **Top giver**, **Top receiver** and **Favourite pairing**: who gave the most, who received the most, the giver and receiver pair with the most between them, and who has been given it by the most different people
+- **Suits them most**: the person with the highest share of their own messages that get it (at least 20 messages with a reaction), and **Suits channel most** for channels (at least 50)
+- **Self-reacts**: how many times people used it on their own message, which the received counts leave out
+- **Top channels**, **Media vs text**, **Pile size** (the average count on a message and how many are the only one) and **Usually with**, the other emojis that turn up on the same messages
+- **Over time**: the first and latest use with links, the best month, and the last 12 months against the 12 before
+- **Posted on**: the weekday and hour its messages were posted, in UTC
+- **Rank**: its place among every emoji used in the server by raw reaction count, only for all-time numbers with no filters and not for the vote emojis
+
+It counts the same way as `/leaderboard`, so the totals agree with it. With `channel` set the top channels are left out, and with `content` set the media comparison is.
+
 Reactions from bots, reactions on bot messages, and reacting to your own message are not counted. Each person counts once per message, even if they react with several different uploads of the same emoji (e.g. five different upvotes). Deleted messages drop off the leaderboard.
 
 ### Vote stats
@@ -166,6 +180,8 @@ Approval and the voter rankings only include people with at least 20 votes, and 
 Here `channel` doesn't filter. Pick one and you get that channel in detail instead of a ranking: its score and rank, approval, how many messages got a vote and how many have media, score per message, media against text, how controversial it is, who posts and who upvotes there most, its trend and best month, its best and worst messages, and its most used emojis. Every channel is still counted so it can be ranked against the others.
 
 The charts go by when each message was posted, not when it was voted on, since Discord doesn't record when reactions were added. The last month on a chart is usually partial, so the line drops at the right edge. The charts are drawn on the bot's machine with the `canvas` package and use its system fonts, and emoji images come from Discord's CDN. A machine with no fonts installed may draw charts without text (not tested). Standard emojis have no image, so they show as a coloured dot and their name.
+
+The weekday and hour in `/emoji` are when the reacted-to message was posted, not when anyone reacted, and they are UTC, so for a server in another timezone shift them by hand. Who gave an emoji only exists once its reactors have been looked up, so the givers, pairings and self-reacts fill in while the bot is still scanning older messages.
 
 Only messages with at least one reaction are stored, so there is no count of every message someone sent or every message in a channel. That is why `per` divides by messages with a reaction or with a vote, why the first of those is an average over fewer messages than were really sent, and why `/channels` shows "messages with a reaction" and not how busy a channel is. Early months with only a few messages make the monthly averages jumpy, and the running average settles down as messages add up.
 

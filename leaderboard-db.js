@@ -583,6 +583,59 @@ const EMOJI_GIVEN_BY_MONTH = `
     GROUP BY month, r.match_key
 `;
 
+// ---- one emoji: its messages, who gave it, and what it comes with ------------------------------------
+
+// One row per message carrying the emoji, with how much it counts toward received (same counting as the
+// leaderboard, so the totals agree) and when it was posted in ms. The time stays a number so the main
+// thread has no snowflakes to unpack.
+// Params: guildId, the emoji key, the exact vote params, then the filters
+const EMOJI_MESSAGES = `
+    SELECT m.id, m.channel_id, m.author_id, m.has_media,
+           (CAST(m.id AS INTEGER) >> 22) + ${DISCORD_EPOCH} AS at, ${MESSAGE_RECEIVED} AS total
+    FROM reactions r JOIN messages m ON m.id = r.message_id
+    WHERE m.guild_id = ? AND r.match_key = ? ${ONLY_EXACT_VOTES} ${FILTERS}
+    GROUP BY m.id
+    HAVING total > 0
+`;
+
+// Who gave the emoji on whose messages, bots left out, yourself included (the caller counts that apart).
+// CROSS JOIN keeps the walk going from the emoji's reactions to the people; left alone SQLite may start from
+// every reactor in the server. Params as EMOJI_MESSAGES
+const EMOJI_PAIRS = `
+    SELECT x.user_id, m.author_id, COUNT(DISTINCT x.message_id) AS total
+    FROM reactions r
+    CROSS JOIN messages m ON m.id = r.message_id
+    CROSS JOIN reactors x ON x.message_id = r.message_id AND x.emoji = r.emoji
+    LEFT JOIN users u ON u.id = x.user_id
+    WHERE m.guild_id = ? AND r.match_key = ? ${ONLY_EXACT_VOTES} AND COALESCE(u.bot, 0) = 0 ${FILTERS}
+    GROUP BY x.user_id, m.author_id
+`;
+
+// The other emojis on the same messages, as how many messages share each. The vote emojis are held to the
+// exact upload on both sides.
+// Params: guildId, the emoji key, the exact vote params (for the emoji, then for the others), then the filters
+const EMOJI_TOGETHER = `
+    SELECT o.match_key, COUNT(DISTINCT o.message_id) AS together
+    FROM reactions r
+    CROSS JOIN messages m ON m.id = r.message_id
+    CROSS JOIN reactions o ON o.message_id = r.message_id AND o.match_key != r.match_key
+    WHERE m.guild_id = ? AND r.match_key = ? ${ONLY_EXACT_VOTES}
+      AND NOT (o.match_key IN (?, ?) AND o.emoji NOT IN (?, ?))
+      AND (${RECEIVED}) > 0 ${FILTERS}
+    GROUP BY o.match_key
+    ORDER BY together DESC, o.match_key
+    LIMIT ?
+`;
+
+// How many messages each person has with a reaction, for how often their messages get an emoji.
+// Params: guildId, then the filters
+const AUTHOR_MESSAGES = `
+    SELECT m.author_id, COUNT(*) AS messages
+    FROM messages m
+    WHERE m.guild_id = ? ${FILTERS}
+    GROUP BY m.author_id
+`;
+
 const filterParams = (channelId, media, since) => [channelId, channelId, media, media, since, since];
 const votesParams = (vote, guildId, authorId, filters) =>
     [vote.up.id, guildId, vote.up.id, vote.down.id, authorId, authorId, ...filters];
@@ -707,6 +760,21 @@ async function channelDetailInBackground(file, guildId, vote, channelId, media, 
     return { authors, voters, best: best[0] ?? null, worst: worst[0] ?? null, emojis };
 }
 
+// Everything /emoji shows for one emoji key, in one worker. vote is optional, see ONLY_EXACT_VOTES.
+// The channel rows carry every stored message of the server, which is what the emoji's share is out of
+async function emojiStatsInBackground(file, guildId, key, vote, channelId, media, since, withEmojis) {
+    const filters = filterParams(channelId, media, since);
+    const exact = exactVoteParams(vote);
+    const [messages, pairs, together, channels, authors] = await queryInBackground(file, [
+        { sql: EMOJI_MESSAGES, params: [guildId, key, ...exact, ...filters] },
+        { sql: EMOJI_PAIRS, params: [guildId, key, ...exact, ...filters] },
+        { sql: EMOJI_TOGETHER, params: [guildId, key, ...exact, ...exact, ...filters, withEmojis] },
+        { sql: CHANNEL_MESSAGES, params: [guildId, ...filters] },
+        { sql: AUTHOR_MESSAGES, params: [guildId, ...filters] }
+    ]);
+    return { messages, pairs, together, channels, authors };
+}
+
 // Emoji use per month. given = what personId reacted with; otherwise what personId's messages received
 // (null for everyone's). vote is optional, see ONLY_EXACT_VOTES
 async function emojiByMonthInBackground(file, guildId, keys, given, personId, channelId, media, since, vote = null) {
@@ -721,5 +789,5 @@ async function emojiByMonthInBackground(file, guildId, keys, given, personId, ch
 module.exports = {
     openDatabase, emojiKey, hasMedia, createdAt, usageInBackground, profileInBackground,
     votesByMonthInBackground, votesByAuthorInBackground, votesByMessageInBackground,
-    votingHabitsInBackground, emojiByMonthInBackground, channelStatsInBackground, channelDetailInBackground
+    votingHabitsInBackground, emojiByMonthInBackground, emojiStatsInBackground, channelStatsInBackground, channelDetailInBackground
 };

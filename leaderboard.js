@@ -18,12 +18,13 @@ const {
 const {
     openDatabase, hasMedia, createdAt, usageInBackground, profileInBackground,
     votesByMonthInBackground, votesByAuthorInBackground, votesByMessageInBackground,
-    votingHabitsInBackground, emojiByMonthInBackground, channelStatsInBackground, channelDetailInBackground
+    votingHabitsInBackground, emojiByMonthInBackground, emojiStatsInBackground, channelStatsInBackground,
+    channelDetailInBackground
 } = require('./leaderboard-db');
 const { renderLineChart, emojiIconUrl } = require('./leaderboard-chart');
 const {
     wilson, spanOf, alignToMonths, runningTotal, rankHaters, rankFans, pickTop, parseMonth, trimMonths, ratioSeries, trendOf, peakMonth,
-    MIN_HATER_TOTAL_DOWNVOTES, MIN_FAN_TOTAL_UPVOTES
+    summariseEmoji, summarisePairs, peakIndex, biggest, MIN_MAGNET_MESSAGES, MIN_HATER_TOTAL_DOWNVOTES, MIN_FAN_TOTAL_UPVOTES
 } = require('./leaderboard-stats');
 
 const CONFIG_PATH = path.join(__dirname, 'leaderboard-config.json');
@@ -44,6 +45,9 @@ const MIN_MEDIA_GROUP = 25;        // media and text messages with a vote a chan
 const MIN_TREND_PRIOR = 100;       // score in the year before, below which a trend ratio is just noise
 const MIN_VOTES = 20;          // votes someone needs before /votes ranks their approval or habits
 const EMOJI_GRAPH_MAX = 10;    // lines on /emojigraph, as many as the chart palette has colours for
+const EMOJI_COMPANIONS = 5;    // other emojis /emoji lists as showing up on the same messages
+const EMOJI_COMPANIONS_FETCHED = 6; // one more than shown, so a vote emoji's companion can be left out
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const HABITS_REFRESH_MS = 10 * 60_000;
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -207,7 +211,15 @@ const commands = [
             .setName('sort')
             .setDescription('What to rank channels by (default: net score)')
             .addChoices(...CHANNEL_SORT_CHOICES)),
-        undefined, 'Show this one channel in detail instead of ranking them all')
+        undefined, 'Show this one channel in detail instead of ranking them all'),
+    addFilterOptions(new SlashCommandBuilder()
+        .setName('emoji')
+        .setDescription('Everything about how one emoji is used as a reaction')
+        .setContexts(InteractionContextType.Guild)
+        .addStringOption(emojiOption('The reaction to analyse'))
+        .addBooleanOption(opt => opt
+            .setName('cumulative')
+            .setDescription('Chart a running total instead of per month (default: no)')))
 ];
 const COMMAND_NAMES = commands.map(c => c.name);
 
@@ -958,21 +970,26 @@ module.exports = function setupLeaderboard(client, log) {
 
     const isScanning = (guildId, keys) => scanningGuilds.has(guildId) || db.hasPendingAny(guildId, keys);
 
-    // Votes are placed on messages, so charts are by when the message was posted, not when it was voted on
-    async function sendChart(interaction, png, heading, extraFooter, keys) {
+    // Reactions are placed on messages, so charts are by when the message was posted, not when it was
+    // reacted to. extras: { description, fields, thumbnail } for replies with more than the chart, and a
+    // null png leaves the chart out
+    async function sendChart(interaction, png, heading, extraFooter, keys, extras = {}) {
         const embed = new EmbedBuilder()
             .setTitle(heading)
-            .setImage('attachment://chart.png')
             .setFooter({
                 text: [
-                    'By when each message was posted, not when it was voted on',
+                    'By when each message was posted, not when it was reacted to',
                     extraFooter,
                     isScanning(interaction.guildId, keys) && 'Still counting older messages, totals may change.'
                 ].filter(Boolean).join(' · ')
             });
+        if (extras.description) embed.setDescription(extras.description);
+        if (extras.thumbnail) embed.setThumbnail(extras.thumbnail);
+        if (extras.fields) embed.addFields(extras.fields);
+        if (png) embed.setImage('attachment://chart.png');
         await interaction.editReply({
             embeds: [embed],
-            files: [new AttachmentBuilder(png, { name: 'chart.png' })],
+            files: png ? [new AttachmentBuilder(png, { name: 'chart.png' })] : [],
             allowedMentions: { parse: [] }
         });
     }
@@ -1148,6 +1165,146 @@ module.exports = function setupLeaderboard(client, log) {
             series
         });
         await sendChart(interaction, png, title({ display: '📊' }, 'Emoji over time', []), notes, keys);
+    }
+
+    // ---- one emoji ----
+
+    async function replyEmoji(interaction, emoji, f) {
+        await interaction.deferReply();
+        const guildId = interaction.guildId;
+        const cumulative = interaction.options.getBoolean('cumulative') ?? false;
+        const vote = loadConfig().voteEmojis;
+        const raw = await emojiStatsInBackground(DB_PATH, guildId, emoji.key, vote, f.channelId, f.media, f.since,
+            EMOJI_COMPANIONS_FETCHED);
+        const stats = summariseEmoji(raw.messages);
+        if (!stats.messages) {
+            await interaction.editReply(`No ${emoji.display} reactions found${f.labels.some(Boolean) ? ' with those filters' : ''}.`);
+            return;
+        }
+        const pairs = summarisePairs(raw.pairs);
+        const tracked = getTracked(interaction.guild);
+        const displayOf = new Map(tracked.map(e => [e.key, e.display]));
+
+        const n = (x) => x.toLocaleString('en-US');
+        const pct = (x) => x > 0 && x < 0.001 ? '<0.1%' : `${(x * 100).toFixed(x < 0.1 ? 1 : 0)}%`;
+        const sum = (values) => [...values].reduce((a, b) => a + b, 0);
+        const channelUrl = (channelId, id) => `https://discord.com/channels/${guildId}/${channelId}/${id}`;
+        const day = (ms) => `<t:${Math.floor(ms / 1000)}:d>`;
+        const plural = (count, one, many = `${one}s`) => `${n(count)} ${count === 1 ? one : many}`;
+
+        // What the server holds, for how much of it carries this emoji
+        const serverMessages = sum(raw.channels.map(c => c.messages));
+        const serverMedia = sum(raw.channels.map(c => c.media));
+        const givenTotal = sum([...pairs.givers.values()].map(g => g.total));
+        const fields = [];
+        const add = (name, lines, inline = true) => {
+            const value = lines.filter(Boolean).join('\n');
+            if (value) fields.push({ name, value, inline });
+        };
+
+        // The emoji's pile on a message is how many people gave it, so these are the messages it did best on
+        add('Biggest messages', stats.top.map((r, i) => `**${i + 1}.** ${n(r.total)} · `
+            + `[#${interaction.guild?.channels.cache.get(r.channel_id)?.name ?? 'message'}](${channelUrl(r.channel_id, r.id)}) · `
+            + `<@${r.author_id}> · ${day(r.at)}`), false);
+
+        // People
+        const topGiver = biggest(pairs.givers);
+        const topReceiver = biggest(stats.receivers);
+        const widest = biggest(pairs.fans, v => v);
+        add('Top giver', [
+            topGiver && `<@${topGiver.key}> · **${n(topGiver.value)}**`,
+            topGiver && `${pct(topGiver.value / givenTotal)} of all given, to ${plural(topGiver.entry.people, 'person', 'people')}`
+        ]);
+        add('Top receiver', [
+            `<@${topReceiver.key}> · **${n(topReceiver.value)}**`,
+            `${pct(topReceiver.value / stats.total)} of all received, on ${plural(topReceiver.entry.messages, 'message')}`
+        ]);
+        add('Favourite pairing', [
+            pairs.top && `<@${pairs.top.user_id}> -> <@${pairs.top.author_id}> · **${n(pairs.top.total)}**`,
+            widest && `Most widely given to: <@${widest.key}> · ${plural(widest.value, 'person', 'people')}`
+        ]);
+
+        // Who it suits: the person it lands on most often, out of everything they post that gets a reaction
+        const authorMessages = new Map(raw.authors.map(a => [a.author_id, a.messages]));
+        const magnet = [...stats.receivers]
+            .filter(([id]) => (authorMessages.get(id) ?? 0) >= MIN_MAGNET_MESSAGES)
+            .map(([id, v]) => ({ id, hits: v.messages, of: authorMessages.get(id) }))
+            .sort((a, b) => wilson(b.hits, b.of)[0] - wilson(a.hits, a.of)[0] || (a.id < b.id ? -1 : 1))[0];
+        add('Suits them most', [magnet && `<@${magnet.id}> · on ${pct(magnet.hits / magnet.of)} of their messages (${n(magnet.hits)} of ${n(magnet.of)})`]);
+        add('Self-reacts', [pairs.self > 0 && `${n(pairs.self)} times people used it on their own message`]);
+
+        // Where
+        const channelRows = [...stats.channels].sort((a, b) => b[1].total - a[1].total || (a[0] < b[0] ? -1 : 1));
+        // With a channel chosen there is only the one to show
+        if (!f.channelId) add('Top channels', channelRows.slice(0, 3).map(([id, v]) => `<#${id}> · ${n(v.total)}`));
+        const hotspot = raw.channels
+            .filter(c => c.messages >= MIN_CHANNEL_MESSAGES && stats.channels.has(c.channel_id))
+            .map(c => ({ id: c.channel_id, hits: stats.channels.get(c.channel_id).messages, of: c.messages }))
+            .sort((a, b) => wilson(b.hits, b.of)[0] - wilson(a.hits, a.of)[0] || (a.id < b.id ? -1 : 1))[0];
+        add('Suits channel most', [!f.channelId && hotspot && `<#${hotspot.id}> · on ${pct(hotspot.hits / hotspot.of)} of its messages (${n(hotspot.hits)} of ${n(hotspot.of)})`]);
+
+        // What it lands on
+        // A content filter makes this 100% against 100%
+        if (f.media === null) {
+            add('Media vs text', [
+                `${pct(stats.media / stats.messages)} of its messages have media`,
+                serverMessages > 0 && `${pct(serverMedia / serverMessages)} of all messages with a reaction do`
+            ]);
+        }
+        add('Pile size', [
+            `${(stats.total / stats.messages).toFixed(2)} per message on average`,
+            `${pct(stats.singles / stats.messages)} are a lone ${emoji.display}`
+        ]);
+        const companions = raw.together.filter(r => r.match_key !== emoji.key).slice(0, EMOJI_COMPANIONS);
+        add('Usually with', companions.map(r =>
+            `${displayOf.get(r.match_key) ?? r.match_key} ${pct(r.together / stats.messages)}`), false);
+
+        // When
+        const peak = peakMonth(stats.months, r => r.total);
+        const currentMonth = new Date().toISOString().slice(0, 7);
+        const { recent, prior } = trendOf(stats.months, currentMonth, r => r.total);
+        // A trend needs two whole years, which a period filter would cut short
+        const compared = f.since === null;
+        add('Over time', [
+            `First: ${day(stats.first.at)} · [jump](${channelUrl(stats.first.channel_id, stats.first.id)})`,
+            `Latest: ${day(stats.last.at)} · [jump](${channelUrl(stats.last.channel_id, stats.last.id)})`,
+            peak && `Best month: ${peak.month} (${n(peak.score)})`,
+            compared && (recent > 0 || prior > 0) && `${n(recent)} in the last 12 months, ${n(prior)} in the 12 before`
+        ]);
+        const dayAt = peakIndex(stats.weekdays);
+        const hourAt = peakIndex(stats.hours);
+        add('Posted on', [
+            dayAt !== -1 && `Most on ${WEEKDAYS[dayAt]}s (${pct(stats.weekdays[dayAt] / stats.total)})`,
+            hourAt !== -1 && `Peak hour: ${String(hourAt).padStart(2, '0')}:00 UTC (${pct(stats.hours[hourAt] / stats.total)})`
+        ]);
+
+        // Rank among emojis is by raw reaction count, the way autocomplete orders them, and only means
+        // something over the whole server. A vote emoji's name is shared with other servers' uploads
+        const isVote = !!vote && (emoji.key === vote.up.key || emoji.key === vote.down.key);
+        const used = emojiUsage(guildId);
+        if (f.labels.every(l => !l) && !isVote && used.has(emoji.key)) {
+            const rank = 1 + [...used.values()].filter(total => total > used.get(emoji.key)).length;
+            add('Rank', [`#${rank} of ${n(used.size)} emojis used`, `${pct(used.get(emoji.key) / sum(used.values()))} of all reactions`]);
+        }
+
+        const months = spanOf(stats.months);
+        let png = null;
+        if (months.length >= 2) {
+            const values = alignToMonths(stats.months, months, r => r.total);
+            png = await renderLineChart({
+                title: [`${emoji.name} reactions`, cumulative ? 'running total' : 'per month', ...f.labels].filter(Boolean).join(' - '),
+                labels: months,
+                series: [{ label: emoji.name, values: cumulative ? runningTotal(values) : values, iconUrl: emojiIconUrl(emoji.display) }]
+            });
+        }
+
+        await sendChart(interaction, png, title(emoji, 'Analysis', f.labels), png ? '' : 'Too short a span to chart', [emoji.key], {
+            description: `**${n(stats.total)}** reactions on **${n(stats.messages)}** messages, `
+                + (pairs.givers.size ? `from **${n(pairs.givers.size)}** people to **${n(stats.receivers.size)}**` : `to **${n(stats.receivers.size)}** people`)
+                + (serverMessages > 0 ? `\nOn ${pct(stats.messages / serverMessages)} of messages with a reaction` : ''),
+            thumbnail: emojiIconUrl(emoji.display, 128),
+            fields
+        });
     }
 
     const per1000 = (down, votes) => votes ? (down / votes * 1000).toFixed(1) : '0.0';
@@ -1527,6 +1684,10 @@ module.exports = function setupLeaderboard(client, log) {
 
             if (interaction.commandName === 'topmessages') {
                 await replyTopMessages(interaction, emoji, filters, scanning);
+                return;
+            }
+            if (interaction.commandName === 'emoji') {
+                await replyEmoji(interaction, emoji, filters);
                 return;
             }
 

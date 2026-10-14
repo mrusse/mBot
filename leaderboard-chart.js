@@ -59,9 +59,9 @@ function loadIcon(url) {
 }
 
 // Custom emotes have an ID in their <:name:id> text; standard emoji have no image to fetch
-function emojiIconUrl(display) {
+function emojiIconUrl(display, size = 48) {
     const id = display?.match(/^<a?:\w+:(\d+)>$/)?.[1];
-    return id ? `https://cdn.discordapp.com/emojis/${id}.png?size=48` : null;
+    return id ? `https://cdn.discordapp.com/emojis/${id}.png?size=${size}` : null;
 }
 
 // series: [{ label, values, iconUrl?, colour?, dashed? }], values lining up with labels, null for a gap.
