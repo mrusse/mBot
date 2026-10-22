@@ -3,5 +3,9 @@
     "emojis": [
         "fire:🔥",
         "❓"
-    ]
+    ],
+    "voteEmojis": {
+        "up": "upvote:453705614485618708",
+        "down": "downvote:453705641618440194"
+    }
 }
