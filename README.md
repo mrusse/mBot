@@ -5,6 +5,7 @@ A Discord bot for fun music stuff (and a bit more) in your server:
 - **Shared playlist**: when someone runs `.np` or `.fm`, mBot grabs the song [.fmbot](https://fmbot.xyz/) reports and adds it to a Spotify playlist.
 - **Reaction leaderboards**: `/leaderboard` ranks who has received or given the most of any emoji you choose to track, and `/emoji` breaks down how one emoji is used.
 - **Vote stats**: `/votegraph`, `/emojigraph` and `/votes` chart and rank upvotes, downvotes and emoji use over time.
+- **On this day**: `/featured` shows the most upvoted message from a year ago today, and the bot can post it in a channel every day.
 
 ## Discord Bot Setup
 
@@ -13,6 +14,7 @@ A Discord bot for fun music stuff (and a bit more) in your server:
 - In the **Bot** tab, click **Reset Token** to generate a token. Save this for later.
 - In the **Installation** tab under **Default Install Settings** > **Guild Install**, add the `bot` scope and the following permissions:
   - Add Reactions
+  - Send Messages and Embed Links (only needed for the daily featured post)
   - Manage Messages
   - Read Message History (needed to react, and to count older reactions for the leaderboard)
 - Also add the `applications.commands` scope so the bot can register its slash commands.
@@ -184,6 +186,34 @@ The charts go by when each message was posted, not when it was voted on, since D
 The weekday and hour in `/emoji` are when the reacted-to message was posted, not when anyone reacted, and they are UTC, so for a server in another timezone shift them by hand. Who gave an emoji only exists once its reactors have been looked up, so the givers, pairings and self-reacts fill in while the bot is still scanning older messages.
 
 Only messages with at least one reaction are stored, so there is no count of every message someone sent or every message in a channel. That is why `per` divides by messages with a reaction or with a vote, why the first of those is an average over fewer messages than were really sent, and why `/channels` shows "messages with a reaction" and not how busy a channel is. Early months with only a few messages make the monthly averages jumpy, and the running average settles down as messages add up.
+
+### Featured message
+
+`/featured [ago] [emoji] [date] [channel]` shows the message with the most upvotes that was posted on this calendar day one year ago: its text, its first image, who posted it, the channel, the count and a link to it.
+
+- `ago`: **1 week**, **1 month** or **1 to 10 years** ago (default: 1 year)
+- `emoji`: rank by a different reaction (default: the `up` emoji from `voteEmojis`, or else a tracked emoji named `upvote`)
+- `date`: an exact day instead, like `2024-03-15`
+- `channel`: only feature a message from this channel (default: all channels)
+
+Upvotes are counted the same as on `/leaderboard`, and reposts from `repostBots` are credited to the original poster. Message text isn't stored, so it's fetched from Discord when shown; if the top message was deleted, the next one is used.
+
+A message is only featured if everyone who can see the channel it's shown in can also see the channel it came from, so messages from private channels don't leak into public ones. This needs the member list, which is loaded when `repostBots` is set up; without it, messages are only featured from channels the `@everyone` role can see.
+
+To post it every day, add `featured` to `leaderboard-config.json`, plus a `timezone` so the time and "today" are your local time:
+
+```json
+"timezone": "America/Toronto",
+"featured": { "channel": "general", "time": "10:00" }
+```
+
+- `channel`: the channel's name or ID (default: `general`)
+- `time`: 24-hour time to post at (default: `10:00`)
+- `emoji` and `ago` (optional): the same as the command options, e.g. `"emoji": "fire"` or `"ago": "2 years"`
+- `from` (optional): only feature messages from this channel (name or ID), e.g. `"from": "memes"` (default: all channels)
+- `timezone`: a name from the [timezone list](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones), like `Europe/London`. Without it the bot uses its machine's clock, which in Docker is usually UTC. It also sets which day "today" is for `/featured`
+
+`"featured": true` uses every default. For several posts (e.g. a second one for 🔥 in another channel), give a list of them. If nothing got a reaction that day, nothing is posted. It only posts in the 5 minutes after the set time, so starting the bot or adding `featured` later in the day waits until tomorrow, and if the bot is down at the set time that day's post is skipped (use `/featured` to see it). The bot remembers which day it last posted, so a restart never posts twice. Changes take effect without a restart.
 
 ### How it's stored
 

@@ -231,6 +231,17 @@ function openDatabase(file) {
             GROUP BY m.id
             HAVING total > 0
             ORDER BY total DESC, m.id
+            LIMIT ?`,
+        // The messages posted between two times (ms) with the most of an emoji, for /featured
+        postedBetween: `
+            SELECT m.id, m.channel_id, m.author_id, ${MESSAGE_RECEIVED} AS total
+            FROM reactions r JOIN messages m ON m.id = r.message_id
+            WHERE m.guild_id = ? AND r.match_key = ? AND (? IS NULL OR m.channel_id = ?)
+              AND (CAST(m.id AS INTEGER) >> 22) + ${DISCORD_EPOCH} >= ?
+              AND (CAST(m.id AS INTEGER) >> 22) + ${DISCORD_EPOCH} < ?
+            GROUP BY m.id
+            HAVING total > 0
+            ORDER BY total DESC, m.id
             LIMIT ?`
     }).map(([name, sql]) => [name, db.prepare(sql)]));
 
@@ -385,6 +396,9 @@ function openDatabase(file) {
         topMessages(guildId, key, authorId, channelId, media, since, limit) {
             return q.topMessages.all(guildId, key, authorId, authorId, channelId, channelId, media, media, since, since, limit);
         },
+        // channelId limits it to one channel's messages, or null for all
+        topMessagesBetween: (guildId, key, channelId, from, to, limit) =>
+            q.postedBetween.all(guildId, key, channelId, channelId, from, to, limit),
 
         // When nothing is pending anywhere the guild-aware query has to join every reaction of these
         // emojis to its message before it can say no (about half a second on this much data, on the

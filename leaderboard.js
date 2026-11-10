@@ -58,6 +58,96 @@ const PERIODS = {
     year: { label: 'Past year', ms: 365 * DAY }
 };
 
+// ---- /featured dates ----
+// "1 year ago" means the same calendar day, in the configured timezone (or the bot machine's own)
+
+const FEATURED_AGO = ['1 week', '1 month', ...Array.from({ length: 10 }, (_, i) => `${i + 1} year${i ? 's' : ''}`)];
+const FEATURED_CANDIDATES = 25; // top messages of the day tried, in case some are deleted or in private channels
+const FEATURED_CHECK_MS = 30_000;
+const FEATURED_WINDOW_MINUTES = 5; // the daily post only goes out this soon after its time, never later
+
+function parseAgo(text) {
+    const match = String(text).trim().match(/^(\d+)\s*(day|week|month|year)s?$/i);
+    if (!match) throw new Error(`"${text}" isn't a time like "1 week", "1 month" or "2 years"`);
+    const amount = Number(match[1]);
+    const unit = match[2].toLowerCase();
+    return { amount, unit, label: `${amount} ${unit}${amount === 1 ? '' : 's'}` };
+}
+
+// The calendar date (and time) at a moment in a timezone; null timezone means the machine's own
+function zonedParts(ms, timezone) {
+    const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone ?? undefined, hourCycle: 'h23',
+        year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric'
+    }).formatToParts(new Date(ms));
+    const get = (type) => Number(parts.find(p => p.type === type).value);
+    return { year: get('year'), month: get('month'), day: get('day'), hour: get('hour'), minute: get('minute'), second: get('second') };
+}
+
+// When a calendar day starts in a timezone, as ms
+function startOfDay({ year, month, day }, timezone) {
+    const target = Date.UTC(year, month - 1, day);
+    let ms = target;
+    // Twice, so a day where the clocks change still lands on its midnight
+    for (let i = 0; i < 2; i++) {
+        const p = zonedParts(ms, timezone);
+        ms = target - (Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - ms);
+    }
+    return ms;
+}
+
+// Moves a calendar date back; a day that doesn't exist in the month landed on (Feb 29) becomes its last day
+function dateBefore({ year, month, day }, { amount, unit }) {
+    if (unit === 'day' || unit === 'week') {
+        const d = new Date(Date.UTC(year, month - 1, day - amount * (unit === 'week' ? 7 : 1)));
+        return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+    }
+    const months = year * 12 + (month - 1) - amount * (unit === 'year' ? 12 : 1);
+    const y = Math.floor(months / 12);
+    const m = months % 12 + 1;
+    return { year: y, month: m, day: Math.min(day, new Date(Date.UTC(y, m, 0)).getUTCDate()) };
+}
+
+function parseDay(text) {
+    const match = text.trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (!match) return null;
+    const [year, month, day] = match.slice(1).map(Number);
+    const d = new Date(Date.UTC(year, month - 1, day));
+    return d.getUTCMonth() === month - 1 && d.getUTCDate() === day ? { year, month, day } : null;
+}
+
+const nextDay = ({ year, month, day }) => dateBefore({ year, month, day }, { amount: -1, unit: 'day' });
+const dayKey = ({ year, month, day }) => `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+const dayLabel = ({ year, month, day }) => new Date(Date.UTC(year, month - 1, day))
+    .toLocaleDateString('en-US', { timeZone: 'UTC', month: 'long', day: 'numeric', year: 'numeric' });
+
+// The daily post: "featured" in the config, as one entry or a list. true uses every default.
+function parseFeatured(entry) {
+    if (!entry) return [];
+    return (Array.isArray(entry) ? entry : [entry === true ? {} : entry]).map(e => {
+        const time = String(e.time ?? '10:00').trim().match(/^(\d{1,2}):(\d{2})$/);
+        if (!time || Number(time[1]) > 23 || Number(time[2]) > 59) throw new Error(`featured time "${e.time}" should be like "10:00" or "18:30"`);
+        return {
+            channel: String(e.channel ?? 'general').replace(/^#/, ''),
+            minute: Number(time[1]) * 60 + Number(time[2]),
+            // Only feature messages from this channel (name or ID), or null for every channel
+            from: e.from ? String(e.from).replace(/^#/, '') : null,
+            emoji: e.emoji ? String(e.emoji) : null,
+            ago: parseAgo(e.ago ?? '1 year')
+        };
+    });
+}
+
+function parseTimezone(timezone) {
+    if (!timezone) return null;
+    try {
+        new Intl.DateTimeFormat('en-US', { timeZone: timezone });
+    } catch {
+        throw new Error(`timezone "${timezone}" isn't a timezone name like "America/Toronto"`);
+    }
+    return timezone;
+}
+
 // Filters shared by /leaderboard and /topmessages. The charts only offer periods long enough to span
 // several monthly points
 const CHART_PERIODS = ['year'];
@@ -219,7 +309,26 @@ const commands = [
         .addStringOption(emojiOption('The reaction to analyse'))
         .addBooleanOption(opt => opt
             .setName('cumulative')
-            .setDescription('Chart a running total instead of per month (default: no)')))
+            .setDescription('Chart a running total instead of per month (default: no)'))),
+    new SlashCommandBuilder()
+        .setName('featured')
+        .setDescription('Show the most upvoted message from this day in the past')
+        .setContexts(InteractionContextType.Guild)
+        .addStringOption(opt => opt
+            .setName('ago')
+            .setDescription('How long ago (default: 1 year)')
+            .addChoices(...FEATURED_AGO.map(value => ({ name: `${value} ago`, value }))))
+        .addStringOption(opt => opt
+            .setName('emoji')
+            .setDescription('The reaction to rank by (default: upvote)')
+            .setAutocomplete(true))
+        .addStringOption(opt => opt
+            .setName('date')
+            .setDescription('An exact day instead, like 2024-03-15'))
+        .addChannelOption(opt => opt
+            .setName('channel')
+            .setDescription('Only feature a message from this channel (default: all)')
+            .addChannelTypes(...SCANNED_CHANNEL_TYPES))
 ];
 const COMMAND_NAMES = commands.map(c => c.name);
 
@@ -303,7 +412,8 @@ function configuredRepostBots() {
 
 module.exports = function setupLeaderboard(client, log) {
     let config = {
-        mtime: 0, listed: [], allServerEmojis: false, repostBots: [], usernameMap: new Map(), repostSetup: '[]', voteEmojis: null, lastError: null
+        mtime: 0, listed: [], allServerEmojis: false, repostBots: [], usernameMap: new Map(), repostSetup: '[]', voteEmojis: null,
+        featured: [], timezone: null, lastError: null
     };
 
     // Re-read the config whenever the file changes, so edits apply without a restart
@@ -311,8 +421,9 @@ module.exports = function setupLeaderboard(client, log) {
         try {
             const { mtimeMs } = fs.statSync(CONFIG_PATH);
             if (mtimeMs !== config.mtime) {
-                const { emojis = [], allServerEmojis = false, repostBots = [], usernameMap = {}, voteEmojis = null } =
-                    JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+                const {
+                    emojis = [], allServerEmojis = false, repostBots = [], usernameMap = {}, voteEmojis = null, featured = null, timezone = null
+                } = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
                 const hasMap = Object.keys(usernameMap).length > 0;
                 config = {
                     mtime: mtimeMs,
@@ -324,6 +435,8 @@ module.exports = function setupLeaderboard(client, log) {
                     // Compared with the setup history was last scanned with, to know when to rescan
                     repostSetup: JSON.stringify(hasMap ? { repostBots, usernameMap } : repostBots),
                     voteEmojis: parseVoteEmojis(voteEmojis),
+                    featured: parseFeatured(featured),
+                    timezone: parseTimezone(timezone),
                     lastError: null
                 };
                 const listed = config.listed.map(e => e.name).join(', ');
@@ -331,6 +444,11 @@ module.exports = function setupLeaderboard(client, log) {
                     ? 'all server emojis' + (listed ? ` + ${listed}` : '')
                     : listed || '(none)'));
                 if (repostBots.length) log.info(`Repost bots: ${repostBots.map(b => b.bot).join(', ')}`);
+                for (const f of config.featured) {
+                    const at = `${Math.floor(f.minute / 60)}:${String(f.minute % 60).padStart(2, '0')}`;
+                    log.info(`Featured post: #${f.channel} at ${at} (${config.timezone ?? 'bot machine time'}), `
+                        + `${f.emoji ?? 'upvote'} from ${f.ago.label} ago` + (f.from ? ` in #${f.from}` : ''));
+                }
             }
         } catch (err) {
             if (err.message !== config.lastError) {
@@ -1558,6 +1676,195 @@ module.exports = function setupLeaderboard(client, log) {
         await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
     }
 
+    // ---- /featured and the daily featured post ----
+
+    // Who can see a channel, to make sure a featured message posted there doesn't come from a channel they
+    // can't see. With the member list loaded that's every person who can view it; without it, a message is
+    // only featured from channels everyone (the @everyone role) can view.
+    function viewersOf(guild, channel) {
+        if (!membersLoaded || !channel) return [guild.roles.everyone];
+        return [...guild.members.cache.filter(m => !m.user.bot
+            && channel.permissionsFor(m)?.has(PermissionFlagsBits.ViewChannel)).values()];
+    }
+    const visibleToAll = (channel, viewers) =>
+        viewers.every(v => channel.permissionsFor(v)?.has(PermissionFlagsBits.ViewChannel));
+
+    // upvote by default: the vote emoji if set up, otherwise a tracked emoji named upvote
+    function featuredEmoji(guild, input) {
+        const tracked = getTracked(guild);
+        if (input) return resolveEmoji(input, tracked) ?? null;
+        const up = loadConfig().voteEmojis?.up;
+        return (up && (tracked.find(e => e.key === up.key) ?? up)) ?? tracked.find(e => e.key === 'upvote') ?? null;
+    }
+
+    // The top message of a calendar day that the people in `postedIn` can all see, as a reply, or null if there is none
+    // `from` limits it to one channel's messages, or null for all
+    async function featuredReply(guild, emoji, day, heading, postedIn, from = null) {
+        const timezone = loadConfig().timezone;
+        const rows = db.topMessagesBetween(guild.id, emoji.key, from?.id ?? null,
+            startOfDay(day, timezone), startOfDay(nextDay(day), timezone), FEATURED_CANDIDATES);
+        const viewers = rows.length ? viewersOf(guild, postedIn) : [];
+
+        for (const row of rows) {
+            const channel = guild.channels.cache.get(row.channel_id);
+            if (!channel || !visibleToAll(channel, viewers)) continue;
+            // Message content isn't stored, so it is fetched when featured. Deleted ones are skipped.
+            let message;
+            try {
+                message = await channel.messages.fetch(row.id);
+            } catch {
+                continue;
+            }
+
+            // Reposts are credited to the original poster, the same as the leaderboard
+            const member = guild.members.cache.get(row.author_id) ?? await guild.members.fetch(row.author_id).catch(() => null);
+            const author = member ?? (message.author.id === row.author_id ? message.author : null);
+            const embed = new EmbedBuilder()
+                .setTitle(`⭐ ${heading}`)
+                .setURL(message.url)
+                .setAuthor({ name: member?.displayName ?? author?.globalName ?? author?.username ?? 'Someone',
+                    iconURL: author?.displayAvatarURL({ size: 64 }) })
+                .setTimestamp(message.createdTimestamp);
+
+            const images = [...message.attachments.values()].filter(a => a.contentType?.startsWith('image/'));
+            const otherFiles = [...message.attachments.values()].filter(a => !images.includes(a));
+            const image = images[0]?.url ?? message.embeds.map(e => e.image?.url ?? e.thumbnail?.url).find(Boolean)
+                ?? message.stickers.first()?.url;
+            if (image) embed.setImage(image);
+
+            const summary = `${emoji.display} **${row.total}** · <@${row.author_id}> · <#${row.channel_id}> · [Jump to message](${message.url})`;
+            const files = otherFiles.map(a => `📎 [${a.name}](${a.url})`).join('\n');
+            const content = message.content.length > 3500 ? message.content.slice(0, 3500) + '…' : message.content;
+            embed.setDescription([content, files, summary].filter(Boolean).join('\n\n'));
+            // Mentions in embeds don't notify anyway, but make sure it can never ping
+            return { embeds: [embed], allowedMentions: { parse: [] } };
+        }
+        return null;
+    }
+
+    async function replyFeatured(interaction) {
+        const { guild } = interaction;
+        const emoji = featuredEmoji(guild, interaction.options.getString('emoji'));
+        if (!emoji) {
+            await interaction.reply({
+                content: interaction.options.getString('emoji')
+                    ? "That emoji isn't tracked."
+                    : 'There is no upvote emoji to go by. Pick an emoji, or add "voteEmojis" to the leaderboard config.',
+                flags: MessageFlags.Ephemeral
+            });
+            return;
+        }
+
+        const timezone = loadConfig().timezone;
+        const today = zonedParts(Date.now(), timezone);
+        const dateText = interaction.options.getString('date');
+        let day;
+        let heading;
+        if (dateText) {
+            day = parseDay(dateText);
+            if (!day || dayKey(day) > dayKey(today)) {
+                await interaction.reply({ content: 'The date should be a day in the past, like 2024-03-15.', flags: MessageFlags.Ephemeral });
+                return;
+            }
+            heading = `Featured · ${dayLabel(day)}`;
+        } else {
+            const ago = parseAgo(interaction.options.getString('ago') ?? '1 year');
+            day = dateBefore(today, ago);
+            heading = `${ago.label} ago today · ${dayLabel(day)}`;
+        }
+
+        const from = interaction.options.getChannel('channel');
+        if (from) heading += ` · #${from.name}`;
+
+        // Fetching the messages can take more than the 3 seconds Discord allows before a reply
+        await interaction.deferReply();
+        const reply = await featuredReply(guild, emoji, day, heading,
+            interaction.channel ?? interaction.guild.channels.cache.get(interaction.channelId), from);
+        await interaction.editReply(reply ?? {
+            content: `Nothing got a ${emoji.display} on ${dayLabel(day)}${from ? ` in <#${from.id}>` : ''}.`, allowedMentions: { parse: [] }
+        });
+    }
+
+    // Checked every 30 seconds. A post only goes out in the few minutes after its time, so starting the bot
+    // or adding the config later in the day doesn't post until tomorrow. Each post's last day is saved, so a
+    // restart during those minutes doesn't post twice.
+    const featuredWarnings = new Set();
+    function warnOnce(message) {
+        if (featuredWarnings.has(message)) return;
+        featuredWarnings.add(message);
+        log.warn(message);
+    }
+
+    async function postFeatured() {
+        const { featured, timezone } = loadConfig();
+        if (!featured.length) return;
+        const now = zonedParts(Date.now(), timezone);
+        const today = dayKey(now);
+
+        const findChannel = (guild, nameOrId) => guild.channels.cache.get(nameOrId)
+            ?? guild.channels.cache.find(c => c.name.toLowerCase() === nameOrId.toLowerCase() && c.isTextBased());
+
+        for (const entry of featured) {
+            const minutesPast = now.hour * 60 + now.minute - entry.minute;
+            if (minutesPast < 0 || minutesPast >= FEATURED_WINDOW_MINUTES) continue;
+            let found = false;
+            for (const guild of client.guilds.cache.values()) {
+                const channel = findChannel(guild, entry.channel);
+                if (!channel) continue;
+                found = true;
+                const from = entry.from && findChannel(guild, entry.from);
+                if (entry.from && !from) {
+                    warnOnce(`Featured post: no channel named or with the ID "${entry.from}" to feature messages from`);
+                    continue;
+                }
+                const key = `featured:${channel.id}:${entry.emoji ?? 'upvote'}:${entry.ago.label}` + (from ? `:${from.id}` : '');
+                if (db.getSetting(key) === today) continue;
+                // Saved first, so a failure isn't retried every 30 seconds
+                db.setSetting(key, today);
+
+                const emoji = featuredEmoji(guild, entry.emoji);
+                if (!emoji) {
+                    log.warn(`Featured post: ${entry.emoji ? `"${entry.emoji}" isn't a tracked emoji` : 'no upvote emoji set up (voteEmojis)'}`);
+                    continue;
+                }
+                const needed = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks];
+                if (!channel.permissionsFor(guild.members.me)?.has(needed)) {
+                    log.warn(`Featured post: the bot needs View Channel, Send Messages and Embed Links in #${channel.name}`);
+                    continue;
+                }
+                try {
+                    const day = dateBefore(now, entry.ago);
+                    const heading = `${entry.ago.label} ago today · ${dayLabel(day)}` + (from ? ` · #${from.name}` : '');
+                    const reply = await featuredReply(guild, emoji, day, heading, channel, from);
+                    if (reply) {
+                        await channel.send(reply);
+                        log.info(`Featured post: posted ${emoji.name} from ${dayLabel(day)} in #${channel.name}`);
+                    } else {
+                        log.info(`Featured post: nothing got a ${emoji.name} on ${dayLabel(day)}, skipped`);
+                    }
+                } catch (err) {
+                    log.error(`Featured post failed: ${err.message}`);
+                }
+            }
+            if (!found) warnOnce(`Featured post: no channel named or with the ID "${entry.channel}"`);
+        }
+    }
+
+    client.once(Events.ClientReady, () => {
+        let posting = false;
+        setInterval(async () => {
+            if (posting) return;
+            posting = true;
+            try {
+                await postFeatured();
+            } catch (err) {
+                log.error(`Featured post failed: ${err.message}`);
+            } finally {
+                posting = false;
+            }
+        }, FEATURED_CHECK_MS).unref();
+    });
+
     // /topmessages replies that can still change page, by message ID: { page, pageCount, render }
     const pagedReplies = new Map();
 
@@ -1656,6 +1963,10 @@ module.exports = function setupLeaderboard(client, log) {
 
             if (interaction.commandName === 'profile') {
                 await replyProfile(interaction);
+                return;
+            }
+            if (interaction.commandName === 'featured') {
+                await replyFeatured(interaction);
                 return;
             }
             // These have no emoji option, so they are handled before the emoji lookup below
